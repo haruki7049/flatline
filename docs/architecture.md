@@ -2,7 +2,9 @@
 
 現行パイプライン（`python/pipeline/stream_mic_encoder.py | ./receiver | python/pipeline/stream_decoder.py`）の実装に基づく通信プロトコルと各コンポーネントの仕様。企画段階の思想・将来案は [memo.md](memo.md) を参照（本ドキュメントは実装済みの挙動を正とする）。
 
-> **2026-10 改訂**: 40ms チャンク単位で EnCodec 推論を行う方式（チャンク境界の歪み・かすれ音の原因）を廃止し、パイプラインは「生 PCM をバッファリングし、確定した発話区間のみを一括で EnCodec に通す」方式へ移行した。`stream_mic_encoder.py` は EnCodec/torch に依存しなくなり、マイク入力と VAD 用の RMS 計算のみを行う。EnCodec のエンコード/デコードは `stream_decoder.py` が発話確定後に 1 回だけ実行する。
+> **2026-10 改訂 (1)**: 40ms チャンク単位で EnCodec 推論を行う方式（チャンク境界の歪み・かすれ音の原因）を廃止し、パイプラインは「生 PCM をバッファリングし、確定した発話区間のみを一括で EnCodec に通す」方式へ移行した。`stream_mic_encoder.py` は EnCodec/torch に依存しなくなり、マイク入力と VAD 用の RMS 計算のみを行う。
+>
+> **2026-10 改訂 (2)**: `stream_decoder.py` はエコーバック（受け取った PCM をそのまま encode → decode して再生する）を廃止した。発話確定は「応答を生成するトリガー」としてのみ扱われ、受信 PCM の内容そのものは破棄する。応答は `suno/bark-small` を低 temperature (0.2) で駆動し、定型の冷淡な短文から生成した EnCodec トークンを再生する（§4）。
 
 ## 1. プロセス間通信プロトコル
 
@@ -43,7 +45,7 @@ Python 側は `struct.pack("<HBBI", magic, version, reserved, payload_len)` で�
 
 ### 1.3 EnCodec 推論のタイミング
 
-EnCodec (24kHz, 8 コードブック, 6kbps 相当, `set_target_bandwidth(6.0)`) への入出力は `stream_decoder.py` のみが担う。発話確定後に受け取った一続きの生 PCM に対して `model.encode` → `model.decode` を 1 回の連続推論として実行するため、以前のような 40ms ごとの再推論によるチャンク境界の不連続が発生しない。
+`receiver` から届く「発話確定」パケットは、現在は**応答生成のトリガーとしてのみ**使われる。`stream_decoder.py` はペイロード（ユーザーの発話内容そのもの）を読み捨て、代わりに定型の冷淡な短文から Bark-small で生成した EnCodec トークンを `codec.decode` で PCM に復元して再生する（§4）。EnCodec (24kHz, 8 コードブック, 6kbps 相当, `set_target_bandwidth(6.0)`) はこの最終デコード段にのみ使われ、エンコードは行わない。
 
 ## 2. Zig 側 VAD ステートマシン (`src/receiver.zig`)
 
@@ -84,18 +86,58 @@ const is_silence = (header.reserved == 0);
    - それ以外は `sample_buffer` の先頭 `valid_frames × SAMPLES_PER_FRAME` サンプルぶん（＝末尾の無音を切り捨てた生 PCM）を 1 パケットにまとめ、0xAA55 ヘッダ（`reserved = 1`）を付けて stdout（次段のデコーダ）へ転送し、`[SPEECH COMMITTED]` をログ。
 4. いずれの場合もバッファ・カウンタをリセットして `idle` に戻る。
 
-## 3. 現在の技術的課題と次のアプローチ
+## 4. 冷淡な思考層プロトタイプ (`stream_decoder.py`)
 
-### 3.1 チャンク境界の歪み・かすれ音（解消済み）
+応答生成はまだ「聞いた内容を理解して返す」段階にはなく、**発話確定を単なるトリガーとして固定・短文応答を返す**プロトタイプ。
+
+### 4.1 構成
+
+- モデル: `suno/bark-small`（`transformers.BarkModel` / `AutoProcessor`）。起動時に一度だけロードし、デバイス（CUDA/MPS/CPU）に常駐させる。
+- 最終デコード: Bark が出力する EnCodec 8-stage トークン (`fine_output`, shape `[1, 8, T]`) を、`encodec` パッケージの `EncodecModel.encodec_model_24khz()`（§1.3 と同一モデル）で PCM に変換する。
+- 応答テキスト: 以下の固定フレーズからランダムに 1 つを選択する（`RESPONSE_PHRASES`）。
+
+  ```
+  Acknowledged.
+  Signal received. Stand by.
+  Input logged.
+  Processing complete.
+  State confirmed.
+  Noted.
+  ```
+
+### 4.2 生成ロジック（Semantic → Coarse → Fine）
+
+`python/experiments/generate_speech_lm.py` で確立した手順をそのまま関数化している（`generate_flat_response_tokens`）。
+
+1. **Semantic**: `bark_model.semantic.generate` でテキスト → semantic トークン。
+2. **Coarse**: `bark_model.coarse_acoustics.generate` で semantic → coarse acoustic トークン。
+3. **Fine**: `bark_model.fine_acoustics.generate` で coarse → fine acoustic トークン（= EnCodec 8-stage トークン）。
+
+各段とも `temperature = 0.2` で `do_sample = True`（Fine 段は `BarkFineGenerationConfig` 既定 + `temperature=0.2` を明示指定）とし、感情的な抑揚・ばらつきの少ない平坦な出力に寄せる。各段の `GenerationConfig`（`SEMANTIC_GEN_CONFIG` / `COARSE_GEN_CONFIG` / `FINE_GEN_CONFIG`）はモジュールロード時に 1 回だけ構築し、発話のたびに作り直さない。
+
+### 4.3 処理フロー
+
+1. `receiver` から「発話確定」パケットを受信する（ペイロードは読み捨てる）。
+2. `RESPONSE_PHRASES` からランダムに 1 文を選び、上記の 3 段階生成で EnCodec トークンを得る。
+3. `codec.decode` で PCM に変換し、再生開始時に `[flatline-decoder] Playing response (...)...` を stderr に出力したうえで `sounddevice` で再生する。
+
+### 4.4 既知の制約
+
+- 入力音声の文字起こしも、聞いた内容に基づくテキスト生成も行っていない。応答は発話内容に関わらず固定候補からのランダム選択であり、「オウム返し」から「固定文の読み上げ」になっただけで、対話としての思考層はまだ存在しない（§5.2 のロードマップ）。
+- Bark-small の 3 段階生成（Semantic → Coarse → Fine）は数百 ms〜数秒オーダーの推論コストがあり、発話確定から応答再生開始までの遅延（レイテンシ）は旧来のエコーバックより大きい。
+
+## 5. 現在の技術的課題と次のアプローチ
+
+### 5.1 チャンク境界の歪み・かすれ音（解消済み）
 
 旧実装では `stream_mic_encoder.py` が 40ms (960 サンプル) ごとに独立して EnCodec へ推論をかけていた。EnCodec の SEANet エンコーダ/デコーダは因果的 (causal) な畳み込みで前後の文脈を一部参照するため、40ms 単位で推論セッションを区切るとチャンクの境界で音響特徴が不連続になり、再生時に歪み・かすれが生じていた。
 
-**対応済み**: `stream_mic_encoder.py` は EnCodec 推論を行わず生 PCM を逐次送るだけに変更し、`receiver.zig` が発話区間ぶんの生 PCM をバッファリング、確定後に `stream_decoder.py` が一続きの PCM に対して 1 回だけ `encode` → `decode` を実行するようにした（§1.3）。これによりチャンクごとの再推論・境界不連続が発生しなくなった。ただし発話全体のエンコード/デコードが発話確定後にまとめて走るため、発話が長いほどそのぶん再生開始までの遅延（レイテンシ）が伸びるトレードオフがある。
+**対応済み**: `stream_mic_encoder.py` は EnCodec 推論を行わず生 PCM を逐次送るだけに変更し、`receiver.zig` が発話区間ぶんの生 PCM をバッファリングするようにした。この改修自体はエコーバック時代に行ったものだが、`stream_decoder.py` がエコーバックから応答生成プロトタイプ（§4）に置き換わった現在も、VAD が「発話確定」を1つのまとまった単位で検出する役割は変わらず活きている。40ms ごとの再推論・境界不連続という問題そのものは、エコーバック廃止とは独立に解消済み。
 
-### 3.2 思考層 (LLM) の未結合
+### 5.2 思考層 (LLM) の未結合（部分的に着手）
 
-現状のパイプラインは「マイク入力 → VAD/生PCMバッファリング → EnCodec encode/decode」のみで構成されており、ユーザーの発話をそのまま読み上げるエコーバック止まりである。応答を生成する自己回帰モデル（思考層）はまだ組み込まれていない。`docs/memo.md` に記載の「無感情化（Monotone Control）」や 1B〜2B クラスの軽量 LLM 統合は未着手のフェーズ 3 相当であり、次のマイルストーンとして残っている。
+§4 で「発話確定 → 固定フレーズ群からのランダム選択 → Bark-small による音声合成」という応答生成プロトタイプを導入したが、これは疎通確認目的の仮実装であり、まだ対話としての思考層ではない。入力音声の文字起こし（ASR）も、聞いた内容に基づくテキスト生成（自己回帰モデルによる応答テキスト生成）も行っていない。`docs/memo.md` に記載の「無感情化（Monotone Control）」や 1B〜2B クラスの軽量 LLM 統合は未着手のフェーズ 3 相当であり、次のマイルストーンとして残っている。
 
-### 3.3 Python スキャフォールドの段階的排除
+### 5.3 Python スキャフォールドの段階的排除
 
 EnCodec のエンコード/デコード処理自体は `src/encoder.zig` / `src/decoder.zig` / `src/rvq.zig` に Zig 実装済みで、`hoge --encode` / `hoge --stream` から呼び出せる状態にある。一方、現行の実運用パイプライン (`python/pipeline/stream_mic_encoder.py`, `stream_decoder.py`) はマイク入出力 (`sounddevice`) 周りとストリーミング制御のために依然として Python に依存している。最終的にはこれらの入出力制御も Zig 側 (`src/main.zig` 系) に統合し、単一バイナリ化することを目指す。
