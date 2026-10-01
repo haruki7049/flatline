@@ -17,17 +17,31 @@ const Header = extern struct {
     payload_len: u32,
 };
 
-fn readExact(fd: std.posix.fd_t, buffer: []u8) !bool {
+// Direct POSIX exact read to bypass runtime abstraction issues on pipes
+fn readExact(fd: c_int, buffer: []u8) !bool {
     var total_read: usize = 0;
     while (total_read < buffer.len) {
-        const bytes_read = try std.posix.read(fd, buffer[total_read..]);
-        if (bytes_read == 0) {
+        const rc = std.c.read(fd, buffer.ptr + total_read, buffer.len - total_read);
+        if (rc == 0) {
             if (total_read == 0) return false;
             return error.UnexpectedEof;
         }
-        total_read += bytes_read;
+        if (rc < 0) {
+            return error.ReadFailed;
+        }
+        total_read += @intCast(rc);
     }
     return true;
+}
+
+// Direct POSIX write
+fn writeAll(fd: c_int, buffer: []const u8) !void {
+    var total_written: usize = 0;
+    while (total_written < buffer.len) {
+        const rc = std.c.write(fd, buffer.ptr + total_written, buffer.len - total_written);
+        if (rc <= 0) return error.WriteFailed;
+        total_written += @intCast(rc);
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -40,15 +54,17 @@ pub fn main(init: std.process.Init) !void {
     var silence_frames: usize = 0;
     var speech_frame_count: usize = 0;
 
-    std.debug.print("[flatline-core] VAD buffering active. Waiting for speech...\n", .{});
+    // Use raw stderr write to guarantee visibility before buffer flush
+    _ = std.c.write(2, "[flatline-core] VAD buffering active. Waiting for speech...\n", 60);
 
     while (true) {
         var header_buf: [@sizeOf(Header)]u8 = undefined;
-        const has_header = try readExact(std.posix.STDIN_FILENO, &header_buf);
+        const has_header = try readExact(0, &header_buf);
         if (!has_header) break;
 
         const header: *const Header = @ptrCast(@alignCast(&header_buf));
         if (header.magic != MAGIC_NUMBER) {
+            _ = std.c.write(2, "Invalid magic number received\n", 30);
             return error.InvalidPacket;
         }
 
@@ -56,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
         if (header.payload_len > payload_buf.len) return error.BufferOverflow;
 
         const payload = payload_buf[0..header.payload_len];
-        if (!try readExact(std.posix.STDIN_FILENO, payload)) {
+        if (!try readExact(0, payload)) {
             return error.IncompletePayload;
         }
 
@@ -74,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
                     speech_frame_count = 1;
                     token_buffer.clearRetainingCapacity();
                     try token_buffer.appendSlice(allocator, tokens[0..count]);
-                    std.debug.print("\n>>> [SPEECH STARTED]\n", .{});
+                    _ = std.c.write(2, "\n>>> [SPEECH STARTED]\n", 22);
                 }
             },
             .listening => {
@@ -88,16 +104,24 @@ pub fn main(init: std.process.Init) !void {
                         const valid_frames = speech_frame_count - silence_frames;
 
                         if (valid_frames < MIN_SPEECH_FRAMES) {
-                            std.debug.print("<<< [IGNORED NOISE] Duration: ~{d}ms\n\n", .{valid_frames * 40});
+                            _ = std.c.write(2, "<<< [IGNORED NOISE]\n", 20);
                         } else {
                             const trimmed_len = valid_frames * count;
                             const utterance_tokens = token_buffer.items[0..trimmed_len];
-                            const duration_ms = valid_frames * 40;
 
-                            std.debug.print("<<< [SPEECH COMMITTED] Duration: ~{d}ms, Total Tokens: {d}\n", .{
-                                duration_ms,
-                                utterance_tokens.len,
-                            });
+                            _ = std.c.write(2, "<<< [SPEECH COMMITTED] Transmitting to decoder\n", 47);
+
+                            // Forward committed token frame to decoder via stdout (fd 1)
+                            const payload_bytes: []const u8 = std.mem.sliceAsBytes(utterance_tokens);
+                            const out_header = Header{
+                                .magic = MAGIC_NUMBER,
+                                .version = 1,
+                                .reserved = 0,
+                                .payload_len = @intCast(payload_bytes.len),
+                            };
+
+                            try writeAll(1, std.mem.asBytes(&out_header));
+                            try writeAll(1, payload_bytes);
                         }
 
                         token_buffer.clearRetainingCapacity();
