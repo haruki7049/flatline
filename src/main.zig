@@ -375,6 +375,24 @@ pub fn main(init: std.process.Init) !void {
     const l7_sc_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.7.shortcut.conv.weight_v") ..].ptr));
     const l7_sc_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.7.shortcut.conv.weight_g") ..].ptr));
 
+    // Layer 9 weights (ConvTranspose1d)
+    const conv9_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.9.conv.bias") ..].ptr));
+    const conv9_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.9.conv.weight_v") ..].ptr));
+    const conv9_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.9.conv.weight_g") ..].ptr));
+
+    // Layer 10 weights (ResNet block)
+    const l10_b1_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.block.1.conv.bias") ..].ptr));
+    const l10_b1_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.block.1.conv.weight_v") ..].ptr));
+    const l10_b1_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.block.1.conv.weight_g") ..].ptr));
+
+    const l10_b3_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.block.3.conv.bias") ..].ptr));
+    const l10_b3_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.block.3.conv.weight_v") ..].ptr));
+    const l10_b3_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.block.3.conv.weight_g") ..].ptr));
+
+    const l10_sc_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.shortcut.conv.bias") ..].ptr));
+    const l10_sc_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.shortcut.conv.weight_v") ..].ptr));
+    const l10_sc_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.shortcut.conv.weight_g") ..].ptr));
+
     // Normalize weights
     const conv0_weight_norm = try normalizeConv1dWeights(allocator, conv0_weight_v, conv0_weight_g, 512, 128, 7);
     const conv3_weight_norm = try normalizeConvTranspose1dWeights(allocator, conv3_weight_v, conv3_weight_g, 512, 256, 16);
@@ -386,6 +404,11 @@ pub fn main(init: std.process.Init) !void {
     const l7_b1_norm = try normalizeConv1dWeights(allocator, l7_b1_v, l7_b1_g, 64, 128, 3);
     const l7_b3_norm = try normalizeConv1dWeights(allocator, l7_b3_v, l7_b3_g, 128, 64, 1);
     const l7_sc_norm = try normalizeConv1dWeights(allocator, l7_sc_v, l7_sc_g, 128, 128, 1);
+
+    const conv9_weight_norm = try normalizeConvTranspose1dWeights(allocator, conv9_weight_v, conv9_weight_g, 128, 64, 8);
+    const l10_b1_norm = try normalizeConv1dWeights(allocator, l10_b1_v, l10_b1_g, 32, 64, 3);
+    const l10_b3_norm = try normalizeConv1dWeights(allocator, l10_b3_v, l10_b3_g, 64, 32, 1);
+    const l10_sc_norm = try normalizeConv1dWeights(allocator, l10_sc_v, l10_sc_g, 64, 64, 1);
 
     // 5. Decode tokens into latents [128, 4]
     var sequence_tokens = [_][8]u16{
@@ -468,15 +491,42 @@ pub fn main(init: std.process.Init) !void {
         l7_out[idx] = l7_sc[idx] + l7_res[idx];
     }
 
-    // 14. Inspect output
+    // 14. Layer 8 (ELU)
+    for (l7_out) |*val| {
+        val.* = elu(val.*);
+    }
+
+    // 15. Layer 9 (ConvTranspose1d): [128, 160] -> [64, 640] (Stride 4)
+    const t_up3 = t_up2 * 4;
+    const conv9_out = try allocator.alloc(f32, 64 * t_up3);
+    convTranspose1d(l7_out, 128, t_up2, conv9_weight_norm, conv9_bias[0..64], 64, 8, 4, conv9_out);
+
+    // 16. Layer 10 (ResNet Block): [64, 640] -> [64, 640]
+    const l10_mid = try allocator.alloc(f32, 32 * t_up3);
+    const l10_res = try allocator.alloc(f32, 64 * t_up3);
+    const l10_sc = try allocator.alloc(f32, 64 * t_up3);
+    const l10_out = try allocator.alloc(f32, 64 * t_up3);
+
+    conv1dSame(conv9_out, 64, t_up3, l10_sc_norm, l10_sc_bias[0..64], 64, 1, l10_sc);
+    conv1dSame(conv9_out, 64, t_up3, l10_b1_norm, l10_b1_bias[0..32], 32, 3, l10_mid);
+    for (l10_mid) |*val| {
+        val.* = elu(val.*);
+    }
+    conv1dSame(l10_mid, 32, t_up3, l10_b3_norm, l10_b3_bias[0..64], 64, 1, l10_res);
+
+    for (0..64 * t_up3) |idx| {
+        l10_out[idx] = l10_sc[idx] + l10_res[idx];
+    }
+
+    // 17. Inspect output
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Successfully computed Layer 7 ResNet block ([128, {d}] -> [128, {d}]).\n", .{ t_up2, t_up2 });
-    try stdout.print("Layer 7 Output Channel 0 across first 8 timesteps: ", .{});
+    try stdout.print("Successfully computed Layer 10 ResNet block ([64, {d}] -> [64, {d}]).\n", .{ t_up3, t_up3 });
+    try stdout.print("Layer 10 Output Channel 0 across first 8 timesteps: ", .{});
     for (0..8) |t| {
-        try stdout.print("{d:.4} ", .{l7_out[0 * t_up2 + t]});
+        try stdout.print("{d:.4} ", .{l10_out[0 * t_up3 + t]});
     }
     try stdout.writeByte('\n');
     try stdout.flush();
