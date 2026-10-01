@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const MAGIC_NUMBER: u16 = 0xAA55;
-const SILENCE_TOKEN: i16 = 110;
+const SAMPLES_PER_FRAME: usize = 960; // 40ms @ 24kHz
 const SILENCE_THRESHOLD_FRAMES: usize = 12; // 40ms * 12 = 480ms of silence
 const MIN_SPEECH_FRAMES: usize = 3; // Filter out noise below 120ms
 
@@ -13,7 +13,7 @@ const State = enum {
 const Header = extern struct {
     magic: u16,
     version: u8,
-    reserved: u8,
+    reserved: u8, // is_speech flag (0 = silence, 1 = speech), set by the sender
     payload_len: u32,
 };
 
@@ -47,8 +47,9 @@ fn writeAll(fd: c_int, buffer: []const u8) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
-    var token_buffer: std.ArrayListUnmanaged(i16) = .empty;
-    defer token_buffer.deinit(allocator);
+    // Buffers raw PCM samples (i16, 24kHz, mono) for the in-progress utterance.
+    var sample_buffer: std.ArrayListUnmanaged(i16) = .empty;
+    defer sample_buffer.deinit(allocator);
 
     var state: State = .idle;
     var silence_frames: usize = 0;
@@ -77,10 +78,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const count = header.payload_len / @sizeOf(i16);
-        const tokens: [*]align(@alignOf(i16)) const i16 = @ptrCast(@alignCast(payload.ptr));
-        const first_token = tokens[0];
+        const samples: [*]align(@alignOf(i16)) const i16 = @ptrCast(@alignCast(payload.ptr));
 
-        const is_silence = (first_token == SILENCE_TOKEN);
+        const is_silence = (header.reserved == 0);
 
         switch (state) {
             .idle => {
@@ -88,14 +88,14 @@ pub fn main(init: std.process.Init) !void {
                     state = .listening;
                     silence_frames = 0;
                     speech_frame_count = 1;
-                    token_buffer.clearRetainingCapacity();
-                    try token_buffer.appendSlice(allocator, tokens[0..count]);
+                    sample_buffer.clearRetainingCapacity();
+                    try sample_buffer.appendSlice(allocator, samples[0..count]);
                     _ = std.c.write(2, "\n>>> [SPEECH STARTED]\n", 22);
                 }
             },
             .listening => {
                 speech_frame_count += 1;
-                try token_buffer.appendSlice(allocator, tokens[0..count]);
+                try sample_buffer.appendSlice(allocator, samples[0..count]);
 
                 if (is_silence) {
                     silence_frames += 1;
@@ -106,17 +106,17 @@ pub fn main(init: std.process.Init) !void {
                         if (valid_frames < MIN_SPEECH_FRAMES) {
                             _ = std.c.write(2, "<<< [IGNORED NOISE]\n", 20);
                         } else {
-                            const trimmed_len = valid_frames * count;
-                            const utterance_tokens = token_buffer.items[0..trimmed_len];
+                            const trimmed_len = valid_frames * SAMPLES_PER_FRAME;
+                            const utterance_samples = sample_buffer.items[0..trimmed_len];
 
                             _ = std.c.write(2, "<<< [SPEECH COMMITTED] Transmitting to decoder\n", 47);
 
-                            // Forward committed token frame to decoder via stdout (fd 1)
-                            const payload_bytes: []const u8 = std.mem.sliceAsBytes(utterance_tokens);
+                            // Forward the committed, silence-trimmed raw PCM utterance via stdout (fd 1)
+                            const payload_bytes: []const u8 = std.mem.sliceAsBytes(utterance_samples);
                             const out_header = Header{
                                 .magic = MAGIC_NUMBER,
                                 .version = 1,
-                                .reserved = 0,
+                                .reserved = 1,
                                 .payload_len = @intCast(payload_bytes.len),
                             };
 
@@ -124,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
                             try writeAll(1, payload_bytes);
                         }
 
-                        token_buffer.clearRetainingCapacity();
+                        sample_buffer.clearRetainingCapacity();
                         silence_frames = 0;
                         speech_frame_count = 0;
                     }

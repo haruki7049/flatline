@@ -24,7 +24,7 @@ model.set_target_bandwidth(6.0)
 model.to(device)
 model.eval()
 
-sys.stderr.write(f"[flatline-decoder] Ready on [{device}]. Listening for committed tokens...\n")
+sys.stderr.write(f"[flatline-decoder] Ready on [{device}]. Listening for committed utterances...\n")
 
 
 def read_exact(n):
@@ -54,29 +54,19 @@ try:
         if payload is None:
             break
 
-        # Convert bytes back to int16 tokens
-        tokens_np = np.frombuffer(payload, dtype=np.int16)
+        # Committed utterance as raw PCM (int16, 24kHz, mono)
+        pcm_i16 = np.frombuffer(payload, dtype=np.int16)
+        audio_f32 = pcm_i16.astype(np.float32) / 32768.0
 
-        num_codebooks = 8
-        total_tokens = len(tokens_np)
-        if total_tokens % num_codebooks != 0:
-            sys.stderr.write(f"Corrupted frame size: {total_tokens}\n")
-            continue
-
-        num_timesteps = total_tokens // num_codebooks
-
-        # Reshape to (timesteps, codebooks) and transpose back to (1, codebooks, timesteps)
-        tokens_tensor = (
-            torch.from_numpy(tokens_np.astype(np.int64))
-            .reshape(num_timesteps, num_codebooks)
-            .transpose(0, 1)
-            .unsqueeze(0)
-            .to(device)
+        audio_tensor = (
+            torch.from_numpy(audio_f32).unsqueeze(0).unsqueeze(0).to(device)
         )
 
         with torch.no_grad():
-            # Decode discrete audio tokens back to 24kHz PCM
-            wav = model.decode([(tokens_tensor, None)])
+            # Single continuous encode/decode pass over the whole utterance
+            # (no 40ms-chunk re-inference, avoiding boundary artifacts).
+            frames = model.encode(audio_tensor)
+            wav = model.decode(frames)
             audio_out = wav.squeeze().cpu().numpy()
 
         sys.stderr.write(

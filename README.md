@@ -17,23 +17,24 @@
      │ sounddevice (24kHz, 40ms チャンク)
      ▼
 python/pipeline/stream_mic_encoder.py
-  - EnCodec 24kHz エンコーダ (PyTorch, CUDA/MPS/CPU 自動選択)
-  - RMS エネルギーで is_speech フラグを算出
-  - 0xAA55 ヘッダ + RVQ トークン(int16) を stdout へ書き込み
+  - EnCodec には依存しない。生 PCM (int16) をそのまま送るだけ
+  - RMS エネルギーで is_speech フラグを算出し、ヘッダの reserved に格納
+  - 0xAA55 ヘッダ + 生 PCM(int16) を stdout へ書き込み
      │ stdout → stdin (パイプ)
      ▼
 ./receiver (src/receiver.zig, zig build-exe)
-  - VAD ステートマシン (Idle / Listening)
-  - 無音/ノイズのフレームを捨て、確定した発話区間のトークン列だけを
-    まとめて次段へ転送
+  - VAD ステートマシン (Idle / Listening)。判定はヘッダの is_speech フラグで行う
+  - 無音/ノイズのフレームを捨て、確定した発話区間の生 PCM だけを
+    一括りにまとめて次段へ転送
      │ stdout → stdin (パイプ)
      ▼
 python/pipeline/stream_decoder.py
-  - 受け取ったトークン列を EnCodec デコーダで PCM に復元
+  - 受け取った一続きの生 PCM に対して EnCodec で encode → decode を
+    1 回だけ実行（40ms ごとの再推論はしない）
   - sounddevice でスピーカーへ再生
 ```
 
-将来的には、`receiver` と `stream_mic_encoder.py` / `stream_decoder.py` が担っている EnCodec 処理を `src/encoder.zig` / `src/decoder.zig` に完全に置き換え、思考層 (LLM) も Zig 側に統合して単一バイナリ化する。
+40ms チャンク単位で EnCodec 推論をかけていた旧方式はチャンク境界で歪み・かすれ音が生じていたため、現在は上記の通り「発話が確定するまでは生 PCM のまま中継し、確定後に一括で EnCodec へ通す」方式に変更済み（詳細は [docs/architecture.md](docs/architecture.md) §1.3, §3.1）。将来的には、`stream_decoder.py` が担っている EnCodec 処理を `src/encoder.zig` / `src/decoder.zig` に置き換え、思考層 (LLM) も Zig 側に統合して単一バイナリ化する。
 
 ## ディレクトリ構成
 
@@ -110,10 +111,9 @@ python/pipeline/stream_mic_encoder.py | ./receiver | python/pipeline/stream_deco
 ## 現在の進捗とロードマップ
 
 - **Phase 1〜4: 完了**
-  - マイク入力 → EnCodec トークン化 → UNIX パイプ通信 → Zig 側 VAD・バッファリング → デコーダによるエコーバックの導通確認まで成立。
-- **既知の課題**
-  - 40ms 単位のチャンク分割により、チャンク境界で歪み・かすれ音が発生する（`stream_mic_encoder.py` が EnCodec を 40ms = 960 サンプル単位で都度エンコードしているため）。
-  - 次回アプローチ: 生 PCM をリングバッファに蓄積し、より長い/連続した単位でエンコードする方式へ移行する。
+  - マイク入力 → UNIX パイプ通信 → Zig 側 VAD・生 PCM バッファリング → 確定発話の一括 EnCodec デコードによるエコーバックの導通確認まで成立。
+- **解消済みの課題**
+  - 40ms 単位のチャンク分割による境界歪み・かすれ音: `stream_mic_encoder.py` が都度 EnCodec 推論をかけていたことが原因だったため、生 PCM バッファリング方式（発話確定後に一括で EnCodec へ通す）に移行して解消した。トレードオフとして、発話が長いほど再生開始までの遅延が伸びる。
 - **次のマイルストーン**
   - 思考層 (LLM) の結合。現状は録音内容をそのまま復元するエコーバックのみで、応答生成は未実装。
   - 最終的に Python スキャフォールド (`python/pipeline/*`) を Zig 実装に置き換え、単一バイナリ化する。
