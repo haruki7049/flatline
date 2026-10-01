@@ -25,10 +25,6 @@ pub fn decodeRVQSequence(
 }
 
 // 1D Convolution with precomputed normalized weights
-// Input:  [C_in, T_in]
-// Weight: [C_out, C_in, K]
-// Bias:   [C_out]
-// Output: [C_out, T_out] where T_out = T_in (with padding = K / 2)
 pub fn conv1dSame(
     in: []const f32,
     c_in: usize,
@@ -61,6 +57,82 @@ pub fn conv1dSame(
             }
 
             out[co * t_len + t] = sum;
+        }
+    }
+}
+
+fn sigmoid(x: f32) f32 {
+    if (x >= 20.0) return 1.0;
+    if (x <= -20.0) return 0.0;
+    return 1.0 / (1.0 + @exp(-x));
+}
+
+fn tanhActivation(x: f32) f32 {
+    if (x >= 20.0) return 1.0;
+    if (x <= -20.0) return -1.0;
+    return std.math.tanh(x);
+}
+
+// Unidirectional LSTM across time dimension
+// in: [H, T], out: [H, T] where H = 512
+pub fn runLstmLayer(
+    in: []const f32,
+    out: []f32,
+    h_dim: usize,
+    t_len: usize,
+    w_ih: [*]const f32,
+    w_hh: [*]const f32,
+    b_ih: [*]const f32,
+    b_hh: [*]const f32,
+    h_state: []f32,
+    c_state: []f32,
+) void {
+    @memset(h_state, 0.0);
+    @memset(c_state, 0.0);
+
+    for (0..t_len) |t| {
+        // Compute all 4 gates for all dimensions
+        for (0..h_dim) |d| {
+            var pre_i = b_ih[d] + b_hh[d];
+            var pre_f = b_ih[h_dim + d] + b_hh[h_dim + d];
+            var pre_g = b_ih[2 * h_dim + d] + b_hh[2 * h_dim + d];
+            var pre_o = b_ih[3 * h_dim + d] + b_hh[3 * h_dim + d];
+
+            const row_ih_i = w_ih + d * h_dim;
+            const row_ih_f = w_ih + (h_dim + d) * h_dim;
+            const row_ih_g = w_ih + (2 * h_dim + d) * h_dim;
+            const row_ih_o = w_ih + (3 * h_dim + d) * h_dim;
+
+            const row_hh_i = w_hh + d * h_dim;
+            const row_hh_f = w_hh + (h_dim + d) * h_dim;
+            const row_hh_g = w_hh + (2 * h_dim + d) * h_dim;
+            const row_hh_o = w_hh + (3 * h_dim + d) * h_dim;
+
+            for (0..h_dim) |k| {
+                const in_val = in[k * t_len + t];
+                const prev_h = h_state[k];
+
+                pre_i += row_ih_i[k] * in_val + row_hh_i[k] * prev_h;
+                pre_f += row_ih_f[k] * in_val + row_hh_f[k] * prev_h;
+                pre_g += row_ih_g[k] * in_val + row_hh_g[k] * prev_h;
+                pre_o += row_ih_o[k] * in_val + row_hh_o[k] * prev_h;
+            }
+
+            const gate_i = sigmoid(pre_i);
+            const gate_f = sigmoid(pre_f);
+            const gate_g = tanhActivation(pre_g);
+            const gate_o = sigmoid(pre_o);
+
+            const next_c = gate_f * c_state[d] + gate_i * gate_g;
+            const next_h = gate_o * tanhActivation(next_c);
+
+            out[d * t_len + t] = next_h;
+            c_state[d] = next_c;
+        }
+
+        // Advance hidden state to t+1
+        for (0..h_dim) |d| {
+            h_state[d] = out[d * t_len + t];
         }
     }
 }
@@ -136,7 +208,6 @@ pub fn main(init: std.process.Init) !void {
         codebooks[stage] = @ptrCast(@alignCast(mapped[payload_start + start_offset ..].ptr));
     }
 
-    // Get decoder.layers.0.conv weights
     const get_offset = struct {
         fn run(r: anytype, k: []const u8) !usize {
             const entry = r.get(k) orelse return error.TensorNotFound;
@@ -145,15 +216,27 @@ pub fn main(init: std.process.Init) !void {
         }
     }.run;
 
+    // Layer 0 weights (Conv1d)
     const bias_offset = try get_offset(root, "decoder.layers.0.conv.bias");
     const weight_v_offset = try get_offset(root, "decoder.layers.0.conv.weight_v");
     const weight_g_offset = try get_offset(root, "decoder.layers.0.conv.weight_g");
 
-    const bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + bias_offset ..].ptr));
-    const weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + weight_v_offset ..].ptr));
-    const weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + weight_g_offset ..].ptr));
+    const conv0_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + bias_offset ..].ptr));
+    const conv0_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + weight_v_offset ..].ptr));
+    const conv0_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + weight_g_offset ..].ptr));
 
-    // Normalize weights: W = g * (v / ||v||)
+    // Layer 1 weights (2-Layer LSTM)
+    const l0_w_ih = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.weight_ih_l0") ..].ptr)));
+    const l0_w_hh = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.weight_hh_l0") ..].ptr)));
+    const l0_b_ih = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.bias_ih_l0") ..].ptr)));
+    const l0_b_hh = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.bias_hh_l0") ..].ptr)));
+
+    const l1_w_ih = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.weight_ih_l1") ..].ptr)));
+    const l1_w_hh = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.weight_hh_l1") ..].ptr)));
+    const l1_b_ih = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.bias_ih_l1") ..].ptr)));
+    const l1_b_hh = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.bias_hh_l1") ..].ptr)));
+
+    // Normalize weights for Conv1d layer 0
     const C_OUT = 512;
     const C_IN = 128;
     const K = 7;
@@ -165,13 +248,13 @@ pub fn main(init: std.process.Init) !void {
         const base = co * slice_len;
 
         for (0..slice_len) |idx| {
-            const val = weight_v[base + idx];
+            const val = conv0_weight_v[base + idx];
             norm_sq += val * val;
         }
 
-        const scale = weight_g[co] / @sqrt(norm_sq);
+        const scale = conv0_weight_g[co] / @sqrt(norm_sq);
         for (0..slice_len) |idx| {
-            weight_norm[base + idx] = weight_v[base + idx] * scale;
+            weight_norm[base + idx] = conv0_weight_v[base + idx] * scale;
         }
     }
 
@@ -189,21 +272,32 @@ pub fn main(init: std.process.Init) !void {
 
     // 6. Run Conv1d: [128, 4] -> [512, 4]
     const conv_out = try allocator.alloc(f32, C_OUT * num_frames);
-    conv1dSame(&latents, C_IN, num_frames, weight_norm, bias[0..C_OUT], C_OUT, K, conv_out);
+    conv1dSame(&latents, C_IN, num_frames, weight_norm, conv0_bias[0..C_OUT], C_OUT, K, conv_out);
 
-    // 7. Inspect output
+    // 7. Run 2-Layer LSTM: [512, 4] -> [512, 4]
+    const lstm_l0_out = try allocator.alloc(f32, C_OUT * num_frames);
+    const lstm_l1_out = try allocator.alloc(f32, C_OUT * num_frames);
+    const h_buf = try allocator.alloc(f32, C_OUT);
+    const c_buf = try allocator.alloc(f32, C_OUT);
+
+    runLstmLayer(conv_out, lstm_l0_out, C_OUT, num_frames, l0_w_ih, l0_w_hh, l0_b_ih, l0_b_hh, h_buf, c_buf);
+    @memset(h_buf, 0.0);
+    @memset(c_buf, 0.0);
+    runLstmLayer(lstm_l0_out, lstm_l1_out, C_OUT, num_frames, l1_w_ih, l1_w_hh, l1_b_ih, l1_b_hh, h_buf, c_buf);
+
+    // 8. Inspect output
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Successfully computed Conv1d layer 0 ([128, {d}] -> [512, {d}]).\n", .{ num_frames, num_frames });
-    try stdout.print("Output channel 0 across 4 frames: ", .{});
+    try stdout.print("Successfully computed 2-Layer LSTM ([512, {d}] -> [512, {d}]).\n", .{ num_frames, num_frames });
+    try stdout.print("LSTM Layer 1 Channel 0 across 4 frames: ", .{});
     for (0..num_frames) |t| {
-        try stdout.print("{d:.4} ", .{conv_out[0 * num_frames + t]});
+        try stdout.print("{d:.4} ", .{lstm_l1_out[0 * num_frames + t]});
     }
-    try stdout.print("\nOutput channel 1 across 4 frames: ", .{});
+    try stdout.print("\nLSTM Layer 1 Channel 1 across 4 frames: ", .{});
     for (0..num_frames) |t| {
-        try stdout.print("{d:.4} ", .{conv_out[1 * num_frames + t]});
+        try stdout.print("{d:.4} ", .{lstm_l1_out[1 * num_frames + t]});
     }
     try stdout.writeByte('\n');
     try stdout.flush();
