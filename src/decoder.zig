@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const nn = @import("nn.zig");
 const rvq = @import("rvq.zig");
+const seanet = @import("seanet.zig");
 const SafeTensors = @import("model.zig").SafeTensors;
 
 pub const sample_rate = 24000;
@@ -36,29 +37,12 @@ pub const Decoder = struct {
         errdefer arena.deinit();
         const allocator = arena.allocator();
 
-        var codebooks: [rvq.num_stages][]const f32 = undefined;
-        var codebook_dim: usize = 0;
-        for (&codebooks, 0..) |*codebook, stage| {
-            const t = try weights.tensorFmt("quantizer.layers.{d}.codebook.embed", .{stage});
-            if (t.rank != 2) return error.ShapeMismatch;
-            codebook.* = t.data;
-            codebook_dim = t.shape()[1];
-        }
-        const quantizer = try rvq.Quantizer.init(codebooks, codebook_dim);
+        const quantizer = try rvq.Quantizer.load(weights);
 
-        const conv_in = try loadConv1d(allocator, weights, "decoder.layers.0.conv", .{});
+        const conv_in = try seanet.loadConv1d(allocator, weights, 1, "decoder.layers.0.conv", .{});
         if (conv_in.c_in != quantizer.dim) return error.ShapeMismatch;
 
-        var lstm_params: [2]nn.LstmParams = undefined;
-        for (&lstm_params, 0..) |*p, l| {
-            p.* = .{
-                .weight_ih = (try weights.tensorFmt("decoder.layers.1.lstm.weight_ih_l{d}", .{l})).data,
-                .weight_hh = (try weights.tensorFmt("decoder.layers.1.lstm.weight_hh_l{d}", .{l})).data,
-                .bias_ih = (try weights.tensorFmt("decoder.layers.1.lstm.bias_ih_l{d}", .{l})).data,
-                .bias_hh = (try weights.tensorFmt("decoder.layers.1.lstm.bias_hh_l{d}", .{l})).data,
-            };
-        }
-        const lstm = try nn.Lstm(2).init(lstm_params);
+        const lstm = try seanet.loadLstm(weights, "decoder.layers.1.lstm");
         if (lstm.hiddenSize() != conv_in.c_out) return error.ShapeMismatch;
 
         var stages: [ratios.len]UpsampleStage = undefined;
@@ -69,23 +53,19 @@ pub const Decoder = struct {
 
             const conv_tr = try nn.ConvTranspose1d.initWeightNorm(
                 allocator,
-                try loadWeightNorm(weights, "decoder.layers.{d}.conv", .{conv_tr_index}),
+                try seanet.loadWeightNorm(weights, "decoder.layers.{d}.conv", .{conv_tr_index}),
                 ratio,
             );
             if (conv_tr.c_in != channels) return error.ShapeMismatch;
 
-            const resnet = try nn.ResnetBlock.init(
-                try loadConv1d(allocator, weights, "decoder.layers.{d}.block.1.conv", .{resnet_index}),
-                try loadConv1d(allocator, weights, "decoder.layers.{d}.block.3.conv", .{resnet_index}),
-                try loadConv1d(allocator, weights, "decoder.layers.{d}.shortcut.conv", .{resnet_index}),
-            );
+            const resnet = try seanet.loadResnetBlock(allocator, weights, "decoder.layers.{d}", .{resnet_index});
             if (resnet.channels() != conv_tr.c_out) return error.ShapeMismatch;
 
             stage.* = .{ .conv_tr = conv_tr, .resnet = resnet };
             channels = resnet.channels();
         }
 
-        const conv_out = try loadConv1d(allocator, weights, "decoder.layers.15.conv", .{});
+        const conv_out = try seanet.loadConv1d(allocator, weights, 1, "decoder.layers.15.conv", .{});
         if (conv_out.c_in != channels) return error.ShapeMismatch;
 
         return .{
@@ -146,20 +126,3 @@ pub const Decoder = struct {
         return audio;
     }
 };
-
-fn loadWeightNorm(weights: *const SafeTensors, comptime prefix: []const u8, args: anytype) !nn.WeightNormParams {
-    const v = try weights.tensorFmt(prefix ++ ".weight_v", args);
-    const g = try weights.tensorFmt(prefix ++ ".weight_g", args);
-    const bias = try weights.tensorFmt(prefix ++ ".bias", args);
-    if (v.rank != 3) return error.ShapeMismatch;
-    return .{
-        .weight_v = v.data,
-        .weight_g = g.data,
-        .bias = bias.data,
-        .shape = v.shape()[0..3].*,
-    };
-}
-
-fn loadConv1d(allocator: Allocator, weights: *const SafeTensors, comptime prefix: []const u8, args: anytype) !nn.Conv1d {
-    return nn.Conv1d.initWeightNorm(allocator, try loadWeightNorm(weights, prefix, args));
-}

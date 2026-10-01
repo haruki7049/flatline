@@ -38,8 +38,9 @@ fn weightNorm(allocator: Allocator, p: WeightNormParams) ![]f32 {
     return norm;
 }
 
-/// Causal 1D convolution with stride 1, matching EnCodec's SConv1d (causal=True,
-/// pad_mode='reflect'): the input is reflect-padded by kernel_size - 1 on the left only.
+/// Causal 1D convolution, matching EnCodec's SConv1d (causal=True, pad_mode='reflect').
+/// The input is reflect-padded by kernel_size - stride on the left, plus on the right just
+/// enough for the last window to be full, so the output length is ceil(t_in / stride).
 /// Tensors are channel-major: [channels, time].
 pub const Conv1d = struct {
     /// [c_out, c_in, kernel_size]
@@ -48,16 +49,19 @@ pub const Conv1d = struct {
     c_in: usize,
     c_out: usize,
     kernel_size: usize,
+    stride: usize,
 
-    pub fn initWeightNorm(allocator: Allocator, p: WeightNormParams) !Conv1d {
+    pub fn initWeightNorm(allocator: Allocator, p: WeightNormParams, stride: usize) !Conv1d {
         const c_out, const c_in, const kernel_size = p.shape;
         if (p.bias.len != c_out) return error.ShapeMismatch;
+        if (stride == 0 or kernel_size < stride) return error.ShapeMismatch;
         return .{
             .weight = try weightNorm(allocator, p),
             .bias = p.bias,
             .c_in = c_in,
             .c_out = c_out,
             .kernel_size = kernel_size,
+            .stride = stride,
         };
     }
 
@@ -65,46 +69,65 @@ pub const Conv1d = struct {
         allocator.free(self.weight);
     }
 
-    /// `in` is [c_in, t_len], `out` is [c_out, t_len].
-    pub fn forward(self: Conv1d, in: []const f32, t_len: usize, out: []f32) void {
-        std.debug.assert(in.len == self.c_in * t_len);
-        std.debug.assert(out.len == self.c_out * t_len);
+    pub fn outputLen(self: Conv1d, t_in: usize) usize {
+        return std.math.divCeil(usize, t_in, self.stride) catch unreachable;
+    }
 
+    /// `in` is [c_in, t_in], `out` is [c_out, outputLen(t_in)].
+    pub fn forward(self: Conv1d, in: []const f32, t_in: usize, out: []f32) void {
         const c_in = self.c_in;
         const kernel_size = self.kernel_size;
-        const pad = kernel_size - 1;
+        const stride = self.stride;
+        const t_out = self.outputLen(t_in);
+
+        std.debug.assert(in.len == c_in * t_in);
+        std.debug.assert(out.len == self.c_out * t_out);
+
+        // get_extra_padding_for_conv1d: pad the right so the last window is full
+        const pad_left = kernel_size - stride;
+        const pad_right = t_out * stride - t_in;
 
         for (0..self.c_out) |co| {
             const bias_val = self.bias[co];
             const w_co = self.weight[co * (c_in * kernel_size) .. (co + 1) * (c_in * kernel_size)];
 
-            for (0..t_len) |t| {
+            for (0..t_out) |t| {
                 var sum: f32 = bias_val;
 
                 for (0..c_in) |ci| {
-                    const in_channel = in[ci * t_len .. (ci + 1) * t_len];
+                    const in_channel = in[ci * t_in .. (ci + 1) * t_in];
                     const w_channel = w_co[ci * kernel_size .. (ci + 1) * kernel_size];
 
                     for (0..kernel_size) |k| {
-                        // Position in the padded input is t + k; the first `pad` samples are padding.
-                        const in_val = if (t + k >= pad)
-                            in_channel[t + k - pad]
+                        // Position in the padded input; the first `pad_left` samples are padding.
+                        const j = t * stride + k;
+                        const in_val = if (j >= pad_left and j - pad_left < t_in)
+                            in_channel[j - pad_left]
                         else
-                            reflectLeft(in_channel, pad - (t + k));
+                            reflectPadded(in_channel, pad_left, pad_right, j);
                         sum += in_val * w_channel[k];
                     }
                 }
 
-                out[co * t_len + t] = sum;
+                out[co * t_out + t] = sum;
             }
         }
     }
 };
 
-// Value of the left reflect padding `distance` samples before the first sample (x[distance]).
-// Like EnCodec's pad1d, an input too short to reflect is first extended with zeros on the right.
-fn reflectLeft(x: []const f32, distance: usize) f32 {
-    return if (distance < x.len) x[distance] else 0.0;
+/// Element `j` of EnCodec's pad1d(x, (pad_left, pad_right), mode='reflect').
+/// Like pad1d, an input too short to reflect is first extended with zeros on the right
+/// (and those zeros are dropped again from the end of the result).
+fn reflectPadded(x: []const f32, pad_left: usize, pad_right: usize, j: usize) f32 {
+    const max_pad = @max(pad_left, pad_right);
+    const ext_len = if (x.len <= max_pad) max_pad + 1 else x.len;
+    const i = if (j < pad_left)
+        pad_left - j
+    else if (j - pad_left < ext_len)
+        j - pad_left
+    else
+        ext_len - 2 - (j - pad_left - ext_len);
+    return if (i < x.len) x[i] else 0.0;
 }
 
 /// Causal 1D transposed convolution (upsampling by `stride`), matching EnCodec's
@@ -185,7 +208,7 @@ test "weight norm rescales each slice to its gain" {
         .weight_g = &.{ 10.0, 1.0 },
         .bias = &.{ 0.0, 0.0 },
         .shape = .{ 2, 1, 2 },
-    });
+    }, 1);
     defer conv.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(f32, &.{ 6.0, 8.0, 0.0, 1.0 }, conv.weight);
 }
@@ -196,7 +219,7 @@ test "weight norm rejects mismatched shapes" {
         .weight_g = &.{1.0},
         .bias = &.{0.0},
         .shape = .{ 1, 1, 2 },
-    }));
+    }, 1));
 }
 
 test "Conv1d reflect-pads on the left only" {
@@ -206,7 +229,7 @@ test "Conv1d reflect-pads on the left only" {
         .weight_g = &.{@sqrt(@as(f32, 3.0))},
         .bias = &.{0.5},
         .shape = .{ 1, 1, 3 },
-    });
+    }, 1);
     defer conv.deinit(std.testing.allocator);
 
     // Padded input: [3, 2 | 1, 2, 3, 4]
@@ -222,6 +245,53 @@ test "Conv1d reflect-pads on the left only" {
     conv.forward(&short, 2, &short_out);
     const short_expected = [_]f32{ 3.5, 5.5 };
     for (short_expected, short_out) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+}
+
+// Expected values below were checked against encodec.modules.conv.pad1d + F.conv1d.
+test "Conv1d with stride reflect-pads both ends like SConv1d" {
+    const allocator = std.testing.allocator;
+
+    // kernel [1, 1, 1, 1], stride 2. Padded input: [3, 2 | 1, 2, 3, 4, 5 | 4]
+    const sum4 = try Conv1d.initWeightNorm(allocator, .{
+        .weight_v = &.{ 1.0, 1.0, 1.0, 1.0 },
+        .weight_g = &.{2.0},
+        .bias = &.{0.0},
+        .shape = .{ 1, 1, 4 },
+    }, 2);
+    defer sum4.deinit(allocator);
+
+    const in = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
+    try std.testing.expectEqual(@as(usize, 3), sum4.outputLen(in.len));
+    var out: [3]f32 = undefined;
+    sum4.forward(&in, in.len, &out);
+    const expected = [_]f32{ 8.0, 10.0, 16.0 };
+    for (expected, out) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+
+    // Too short to reflect: [1] is extended to [1, 0, 0]. Padded input: [0, 0 | 1 | 0]
+    const single = [_]f32{1.0};
+    var single_out: [1]f32 = undefined;
+    sum4.forward(&single, 1, &single_out);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), single_out[0], 1e-5);
+}
+
+test "Conv1d with stride pads short inputs with zeros before reflecting" {
+    const allocator = std.testing.allocator;
+
+    // kernel [1..8] (gain = norm, so weights stay 1..8), stride 4.
+    // Padded input: [0, 0, 3, 2 | 1, 2, 3 | 0]
+    const v = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const conv = try Conv1d.initWeightNorm(allocator, .{
+        .weight_v = &v,
+        .weight_g = &.{@sqrt(@as(f32, 204.0))},
+        .bias = &.{0.0},
+        .shape = .{ 1, 1, 8 },
+    }, 4);
+    defer conv.deinit(allocator);
+
+    const in = [_]f32{ 1.0, 2.0, 3.0 };
+    var out: [1]f32 = undefined;
+    conv.forward(&in, in.len, &out);
+    try std.testing.expectApproxEqAbs(@as(f32, 55.0), out[0], 1e-4);
 }
 
 test "ConvTranspose1d trims the surplus from the right" {

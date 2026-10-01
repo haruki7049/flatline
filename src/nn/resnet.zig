@@ -63,19 +63,19 @@ test "ResnetBlock adds the residual branch to the shortcut" {
         .weight_g = &.{1.0},
         .bias = &.{0.0},
         .shape = .{ 1, 1, 3 },
-    });
+    }, 1);
     const conv2 = try Conv1d.initWeightNorm(allocator, .{
         .weight_v = &.{-1.0},
         .weight_g = &.{1.0},
         .bias = &.{0.0},
         .shape = .{ 1, 1, 1 },
-    });
+    }, 1);
     const shortcut = try Conv1d.initWeightNorm(allocator, .{
         .weight_v = &.{1.0},
         .weight_g = &.{2.0},
         .bias = &.{0.0},
         .shape = .{ 1, 1, 1 },
-    });
+    }, 1);
     const block = try ResnetBlock.init(conv1, conv2, shortcut);
     defer block.deinit(allocator);
 
