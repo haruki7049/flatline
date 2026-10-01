@@ -1,5 +1,55 @@
 const std = @import("std");
 
+// Writes float PCM [-1.0, 1.0] to a 16-bit PCM mono WAV file
+pub fn writeWav16(
+    io: std.Io,
+    file_path: []const u8,
+    samples: []const f32,
+    sample_rate: u32,
+) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{});
+    defer file.close(io);
+
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    const w = &writer.interface;
+
+    const num_samples = @as(u32, @intCast(samples.len));
+    const byte_rate = sample_rate * 2; // 1 channel * 2 bytes/sample
+    const block_align: u16 = 2; // 1 channel * 2 bytes
+    const bits_per_sample: u16 = 16;
+    const data_bytes = num_samples * 2;
+    const riff_chunk_size = 36 + data_bytes;
+
+    // 1. RIFF Header
+    try w.writeAll("RIFF");
+    try w.writeInt(u32, riff_chunk_size, .little);
+    try w.writeAll("WAVE");
+
+    // 2. fmt Sub-chunk
+    try w.writeAll("fmt ");
+    try w.writeInt(u32, 16, .little); // Subchunk1Size (16 for PCM)
+    try w.writeInt(u16, 1, .little); // AudioFormat (1 for PCM)
+    try w.writeInt(u16, 1, .little); // NumChannels (1 = mono)
+    try w.writeInt(u32, sample_rate, .little);
+    try w.writeInt(u32, byte_rate, .little);
+    try w.writeInt(u16, block_align, .little);
+    try w.writeInt(u16, bits_per_sample, .little);
+
+    // 3. data Sub-chunk
+    try w.writeAll("data");
+    try w.writeInt(u32, data_bytes, .little);
+
+    // Convert f32 [-1.0, 1.0] to i16 with clamping
+    for (samples) |sample| {
+        const clamped = std.math.clamp(sample, -1.0, 1.0);
+        const sample_i16 = @as(i16, @intFromFloat(clamped * 32767.0));
+        try w.writeInt(i16, sample_i16, .little);
+    }
+
+    try w.flush();
+}
+
 // Decodes a sequence of RVQ frames into a contiguous latent matrix [128, T]
 pub fn decodeRVQSequence(
     codebooks: []const [*]const f32,
@@ -600,4 +650,9 @@ pub fn main(init: std.process.Init) !void {
     }
     try stdout.writeByte('\n');
     try stdout.flush();
+
+    // 23. Export to WAV file
+    const output_wav_path = "output.wav";
+    try writeWav16(io, output_wav_path, final_audio, 24000);
+    try stdout.print("Successfully exported decoded audio to {s}\n", .{output_wav_path});
 }
