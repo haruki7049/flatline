@@ -24,7 +24,15 @@ SAMPLE_RATE = 24000
 MAGIC_NUMBER = 0xAA55
 HEADER_FMT = "<HBBI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-FLAT_TEMPERATURE = 0.2
+# 0.2 was too low: Bark's autoregressive coarse/fine stages fell into mode
+# collapse (the same acoustic token repeated every step), which decodes as a
+# single-frequency squeal/feedback whine instead of speech. 0.7 keeps the
+# output calm and monotone without the sampling degenerating like that.
+FLAT_TEMPERATURE = 0.7
+
+# Pins the speaker identity so it doesn't drift between utterances (voice_preset=None
+# samples a new, unpredictable voice/timbre on every call).
+VOICE_PRESET = "v2/en_speaker_6"
 
 # The fixed response phrases are all 1-5 words. Bark's semantic stage defaults to
 # max_new_tokens=768 (~10s+ of audio at its ~49Hz semantic rate), which is wildly
@@ -90,7 +98,7 @@ def generate_flat_response_tokens(text: str) -> torch.Tensor:
 
     Returns a tensor shaped [1, 8, T], matching EncodecModel.decode's expected layout.
     """
-    inputs = bark_processor(text, voice_preset=None, return_tensors="pt").to(device)
+    inputs = bark_processor(text, voice_preset=VOICE_PRESET, return_tensors="pt").to(device)
 
     with torch.no_grad():
         semantic_output = bark_model.semantic.generate(

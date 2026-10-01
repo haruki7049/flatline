@@ -113,7 +113,9 @@ const is_silence = (header.reserved == 0);
 2. **Coarse**: `bark_model.coarse_acoustics.generate` で semantic → coarse acoustic トークン。
 3. **Fine**: `bark_model.fine_acoustics.generate` で coarse → fine acoustic トークン（= EnCodec 8-stage トークン）。
 
-各段とも `temperature = 0.2`（Semantic/Coarse は `do_sample = True`）とし、感情的な抑揚・ばらつきの少ない平坦な出力に寄せる。各段の `GenerationConfig`（`SEMANTIC_GEN_CONFIG` / `COARSE_GEN_CONFIG` / `FINE_GEN_CONFIG`）はモジュールロード時に 1 回だけ構築し、発話のたびに作り直さない。
+各段とも `temperature = 0.7`（Semantic/Coarse は `do_sample = True`）とし、感情的な抑揚・ばらつきの少ない平坦な出力に寄せる。`voice_preset` は `"v2/en_speaker_6"` に固定し、発話ごとに声質（話者）が暴れないようにする。各段の `GenerationConfig`（`SEMANTIC_GEN_CONFIG` / `COARSE_GEN_CONFIG` / `FINE_GEN_CONFIG`）はモジュールロード時に 1 回だけ構築し、発話のたびに作り直さない。
+
+> **temperature=0.2 は危険域**: 当初 `FLAT_TEMPERATURE = 0.2` としていたが、極端に低い temperature は Bark の自己回帰的な coarse/fine acoustics 生成でモード崩壊（同一の音響トークンが毎ステップ反復選択される）を引き起こし、デコード結果が人の声ではなく単一周波数の発振音（ハウリング/ピー音）になる不具合があった。`0.7` に引き上げることでサンプリングの多様性を確保し、この崩壊を回避している。
 
 **生成長の上限**: Bark-small の Semantic 段はデフォルトで `max_new_tokens=768`（Semantic レート ~49Hz 換算で 10 秒超）まで生成し得るが、固定応答フレーズは 1〜5 単語の短文しかない。`SEMANTIC_MAX_NEW_TOKENS = 96` でこれを明示的に絞り込み、Semantic 系列長を基準に決まる Coarse/Fine の生成長も連動して短縮する。各段の config 辞書からは競合の原因になる `max_length` を取り除き（`max_new_tokens` のみで上限を管理）、Fine 段の `generate` 呼び出しでは `fine_generation_config` と重複する `temperature` kwarg を渡さないようにした。これにより `transformers` の `Both 'max_new_tokens' and 'max_length' seem to have been set.` / `Passing 'generation_config' together with generation-related arguments... is deprecated` という警告の連打を解消している。
 
