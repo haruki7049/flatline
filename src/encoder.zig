@@ -95,7 +95,7 @@ pub const Encoder = struct {
         // Layer 0 (causal Conv1d): [1, T] -> [32, T]
         var x = try allocator.alloc(f32, self.conv_in.c_out * t_len);
         defer allocator.free(x);
-        self.conv_in.forward(samples, t_len, x);
+        try self.conv_in.forward(allocator, samples, t_len, x);
 
         // Downsampling stages: ResnetBlock -> ELU -> strided causal Conv1d
         for (self.stages) |stage| {
@@ -107,7 +107,7 @@ pub const Encoder = struct {
             const down_len = stage.conv.outputLen(t_len);
             const down = try allocator.alloc(f32, stage.conv.c_out * down_len);
             errdefer allocator.free(down);
-            stage.conv.forward(res, t_len, down);
+            try stage.conv.forward(allocator, res, t_len, down);
 
             allocator.free(x);
             x = down;
@@ -122,7 +122,8 @@ pub const Encoder = struct {
 
         // Layer 15 (Final causal Conv1d): [512, F] -> [128, F]
         const latents = try allocator.alloc(f32, self.conv_out.c_out * t_len);
-        self.conv_out.forward(y, t_len, latents);
+        errdefer allocator.free(latents);
+        try self.conv_out.forward(allocator, y, t_len, latents);
         return latents;
     }
 

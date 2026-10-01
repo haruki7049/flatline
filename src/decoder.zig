@@ -94,7 +94,7 @@ pub const Decoder = struct {
         // Layer 0 (causal Conv1d): [128, T] -> [512, T]
         const conv_in_out = try allocator.alloc(f32, self.conv_in.c_out * t_len);
         defer allocator.free(conv_in_out);
-        self.conv_in.forward(latents, t_len, conv_in_out);
+        try self.conv_in.forward(allocator, latents, t_len, conv_in_out);
 
         // Layer 1 (2-Layer LSTM + skip) and Layer 2 (ELU): [512, T] -> [512, T]
         var x = try allocator.alloc(f32, self.lstm.hiddenSize() * t_len);
@@ -108,7 +108,7 @@ pub const Decoder = struct {
 
             const up = try allocator.alloc(f32, stage.conv_tr.c_out * up_len);
             defer allocator.free(up);
-            stage.conv_tr.forward(x, t_len, up);
+            try stage.conv_tr.forward(allocator, x, t_len, up);
 
             const res = try allocator.alloc(f32, stage.resnet.channels() * up_len);
             errdefer allocator.free(res);
@@ -122,7 +122,8 @@ pub const Decoder = struct {
 
         // Layer 15 (Final causal Conv1d): [32, T'] -> [1, T']
         const audio = try allocator.alloc(f32, self.conv_out.c_out * t_len);
-        self.conv_out.forward(x, t_len, audio);
+        errdefer allocator.free(audio);
+        try self.conv_out.forward(allocator, x, t_len, audio);
         return audio;
     }
 };

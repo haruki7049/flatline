@@ -40,13 +40,13 @@ pub const ResnetBlock = struct {
         const res = try allocator.alloc(f32, self.conv2.c_out * t_len);
         defer allocator.free(res);
 
-        self.shortcut.forward(in, t_len, out);
+        try self.shortcut.forward(allocator, in, t_len, out);
 
         @memcpy(res, in);
         activation.eluInPlace(res);
-        self.conv1.forward(res, t_len, mid);
+        try self.conv1.forward(allocator, res, t_len, mid);
         activation.eluInPlace(mid);
-        self.conv2.forward(mid, t_len, res);
+        try self.conv2.forward(allocator, mid, t_len, res);
 
         for (out, res) |*o, r| {
             o.* += r;
