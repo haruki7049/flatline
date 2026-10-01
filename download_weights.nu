@@ -2,7 +2,7 @@
 
 # Download model weights if not already present
 def main [] {
-  let target_dir = "weights"
+  let target_dir = "src/weights"
   let target_file = ($target_dir | path join "encodec_24khz.safetensors")
   let url = "https://huggingface.co/facebook/encodec_24khz/resolve/main/model.safetensors"
 
