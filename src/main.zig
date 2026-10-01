@@ -393,6 +393,29 @@ pub fn main(init: std.process.Init) !void {
     const l10_sc_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.shortcut.conv.weight_v") ..].ptr));
     const l10_sc_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.10.shortcut.conv.weight_g") ..].ptr));
 
+    // Layer 12 weights (ConvTranspose1d)
+    const conv12_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.12.conv.bias") ..].ptr));
+    const conv12_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.12.conv.weight_v") ..].ptr));
+    const conv12_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.12.conv.weight_g") ..].ptr));
+
+    // Layer 13 weights (ResNet block)
+    const l13_b1_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.block.1.conv.bias") ..].ptr));
+    const l13_b1_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.block.1.conv.weight_v") ..].ptr));
+    const l13_b1_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.block.1.conv.weight_g") ..].ptr));
+
+    const l13_b3_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.block.3.conv.bias") ..].ptr));
+    const l13_b3_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.block.3.conv.weight_v") ..].ptr));
+    const l13_b3_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.block.3.conv.weight_g") ..].ptr));
+
+    const l13_sc_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.shortcut.conv.bias") ..].ptr));
+    const l13_sc_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.shortcut.conv.weight_v") ..].ptr));
+    const l13_sc_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.13.shortcut.conv.weight_g") ..].ptr));
+
+    // Layer 15 weights (Final Conv1d)
+    const conv15_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.15.conv.bias") ..].ptr));
+    const conv15_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.15.conv.weight_v") ..].ptr));
+    const conv15_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.15.conv.weight_g") ..].ptr));
+
     // Normalize weights
     const conv0_weight_norm = try normalizeConv1dWeights(allocator, conv0_weight_v, conv0_weight_g, 512, 128, 7);
     const conv3_weight_norm = try normalizeConvTranspose1dWeights(allocator, conv3_weight_v, conv3_weight_g, 512, 256, 16);
@@ -409,6 +432,13 @@ pub fn main(init: std.process.Init) !void {
     const l10_b1_norm = try normalizeConv1dWeights(allocator, l10_b1_v, l10_b1_g, 32, 64, 3);
     const l10_b3_norm = try normalizeConv1dWeights(allocator, l10_b3_v, l10_b3_g, 64, 32, 1);
     const l10_sc_norm = try normalizeConv1dWeights(allocator, l10_sc_v, l10_sc_g, 64, 64, 1);
+
+    const conv12_weight_norm = try normalizeConvTranspose1dWeights(allocator, conv12_weight_v, conv12_weight_g, 64, 32, 4);
+    const l13_b1_norm = try normalizeConv1dWeights(allocator, l13_b1_v, l13_b1_g, 16, 32, 3);
+    const l13_b3_norm = try normalizeConv1dWeights(allocator, l13_b3_v, l13_b3_g, 32, 16, 1);
+    const l13_sc_norm = try normalizeConv1dWeights(allocator, l13_sc_v, l13_sc_g, 32, 32, 1);
+
+    const conv15_weight_norm = try normalizeConv1dWeights(allocator, conv15_weight_v, conv15_weight_g, 1, 32, 7);
 
     // 5. Decode tokens into latents [128, 4]
     var sequence_tokens = [_][8]u16{
@@ -518,15 +548,55 @@ pub fn main(init: std.process.Init) !void {
         l10_out[idx] = l10_sc[idx] + l10_res[idx];
     }
 
-    // 17. Inspect output
+    // 17. Layer 11 (ELU)
+    for (l10_out) |*val| {
+        val.* = elu(val.*);
+    }
+
+    // 18. Layer 12 (ConvTranspose1d): [64, 640] -> [32, 1280] (Stride 2)
+    const t_up4 = t_up3 * 2;
+    const conv12_out = try allocator.alloc(f32, 32 * t_up4);
+    convTranspose1d(l10_out, 64, t_up3, conv12_weight_norm, conv12_bias[0..32], 32, 4, 2, conv12_out);
+
+    // 19. Layer 13 (ResNet Block): [32, 1280] -> [32, 1280]
+    const l13_mid = try allocator.alloc(f32, 16 * t_up4);
+    const l13_res = try allocator.alloc(f32, 32 * t_up4);
+    const l13_sc = try allocator.alloc(f32, 32 * t_up4);
+    const l13_out = try allocator.alloc(f32, 32 * t_up4);
+
+    conv1dSame(conv12_out, 32, t_up4, l13_sc_norm, l13_sc_bias[0..32], 32, 1, l13_sc);
+    conv1dSame(conv12_out, 32, t_up4, l13_b1_norm, l13_b1_bias[0..16], 16, 3, l13_mid);
+    for (l13_mid) |*val| {
+        val.* = elu(val.*);
+    }
+    conv1dSame(l13_mid, 16, t_up4, l13_b3_norm, l13_b3_bias[0..32], 32, 1, l13_res);
+
+    for (0..32 * t_up4) |idx| {
+        l13_out[idx] = l13_sc[idx] + l13_res[idx];
+    }
+
+    // 20. Layer 14 (ELU)
+    for (l13_out) |*val| {
+        val.* = elu(val.*);
+    }
+
+    // 21. Layer 15 (Final Conv1d): [32, 1280] -> [1, 1280]
+    const final_audio = try allocator.alloc(f32, 1 * t_up4);
+    conv1dSame(l13_out, 32, t_up4, conv15_weight_norm, conv15_bias[0..1], 1, 7, final_audio);
+
+    // 22. Inspect final audio waveform
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Successfully computed Layer 10 ResNet block ([64, {d}] -> [64, {d}]).\n", .{ t_up3, t_up3 });
-    try stdout.print("Layer 10 Output Channel 0 across first 8 timesteps: ", .{});
-    for (0..8) |t| {
-        try stdout.print("{d:.4} ", .{l10_out[0 * t_up3 + t]});
+    try stdout.print("Complete EnCodec Decoder Pipeline finished successfully!\n", .{});
+    try stdout.print("Decoded PCM Samples Count: {d} (Sample Rate: 24000Hz, Duration: {d:.4}s)\n", .{
+        t_up4,
+        @as(f32, @floatFromInt(t_up4)) / 24000.0,
+    });
+    try stdout.print("First 16 PCM waveform samples:\n", .{});
+    for (0..16) |i| {
+        try stdout.print("{d:.5} ", .{final_audio[i]});
     }
     try stdout.writeByte('\n');
     try stdout.flush();
