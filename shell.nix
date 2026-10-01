@@ -7,6 +7,15 @@ pkgs.mkShell {
     pkgs.zig_0_16
     pkgs.zls_0_16
     pkgs.jq
-    (pkgs.python3.withPackages (ps: [ps.encodec ps.torchaudio]))
+
+    (pkgs.python3.withPackages (ps: [
+      ps.encodec
+      ps.torchaudio
+      ps.transformers
+      ps.accelerate
+      ps.soundfile
+      ps.numpy
+      ps.torch
+    ]))
   ];
 }
