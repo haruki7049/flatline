@@ -141,10 +141,6 @@ pub fn runLstmLayer(
 }
 
 // 1D Transposed Convolution (Upsampling)
-// Input:  [C_in, T_in]
-// Weight: [C_in, C_out, K]
-// Bias:   [C_out]
-// Output: [C_out, T_out] where T_out = T_in * stride
 pub fn convTranspose1d(
     in: []const f32,
     c_in: usize,
@@ -159,7 +155,6 @@ pub fn convTranspose1d(
     const t_out = t_in * stride;
     const pad = (kernel_size - stride) / 2;
 
-    // Initialize with bias
     for (0..c_out) |co| {
         const bias_val = bias[co];
         for (0..t_out) |to| {
@@ -167,7 +162,6 @@ pub fn convTranspose1d(
         }
     }
 
-    // Accumulate kernel contributions
     for (0..c_in) |ci| {
         for (0..c_out) |co| {
             const w_base = ci * (c_out * kernel_size) + co * kernel_size;
@@ -186,6 +180,37 @@ pub fn convTranspose1d(
             }
         }
     }
+}
+
+// Normalizes weights: W = g * (v / ||v||) for Conv1d
+fn normalizeConv1dWeights(
+    allocator: std.mem.Allocator,
+    weight_v: [*]const f32,
+    weight_g: [*]const f32,
+    c_out: usize,
+    c_in: usize,
+    kernel_size: usize,
+) ![]f32 {
+    const total_len = c_out * c_in * kernel_size;
+    const norm = try allocator.alloc(f32, total_len);
+    const slice_len = c_in * kernel_size;
+
+    for (0..c_out) |co| {
+        var norm_sq: f32 = 0.0;
+        const base = co * slice_len;
+
+        for (0..slice_len) |idx| {
+            const val = weight_v[base + idx];
+            norm_sq += val * val;
+        }
+
+        const scale = weight_g[co] / @sqrt(norm_sq);
+        for (0..slice_len) |idx| {
+            norm[base + idx] = weight_v[base + idx] * scale;
+        }
+    }
+
+    return norm;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -288,35 +313,30 @@ pub fn main(init: std.process.Init) !void {
     const conv3_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.3.conv.weight_v") ..].ptr));
     const conv3_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.3.conv.weight_g") ..].ptr));
 
-    // Normalize weights for Conv1d layer 0
+    // Layer 4 weights (ResNet block)
+    const l4_b1_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.block.1.conv.bias") ..].ptr));
+    const l4_b1_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.block.1.conv.weight_v") ..].ptr));
+    const l4_b1_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.block.1.conv.weight_g") ..].ptr));
+
+    const l4_b3_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.block.3.conv.bias") ..].ptr));
+    const l4_b3_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.block.3.conv.weight_v") ..].ptr));
+    const l4_b3_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.block.3.conv.weight_g") ..].ptr));
+
+    const l4_sc_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.shortcut.conv.bias") ..].ptr));
+    const l4_sc_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.shortcut.conv.weight_v") ..].ptr));
+    const l4_sc_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.4.shortcut.conv.weight_g") ..].ptr));
+
+    // Normalize weights
     const C0_OUT = 512;
     const C0_IN = 128;
     const K0 = 7;
-    const conv0_weight_norm = try allocator.alloc(f32, C0_OUT * C0_IN * K0);
+    const conv0_weight_norm = try normalizeConv1dWeights(allocator, conv0_weight_v, conv0_weight_g, C0_OUT, C0_IN, K0);
 
-    for (0..C0_OUT) |co| {
-        var norm_sq: f32 = 0.0;
-        const slice_len = C0_IN * K0;
-        const base = co * slice_len;
-
-        for (0..slice_len) |idx| {
-            const val = conv0_weight_v[base + idx];
-            norm_sq += val * val;
-        }
-
-        const scale = conv0_weight_g[co] / @sqrt(norm_sq);
-        for (0..slice_len) |idx| {
-            conv0_weight_norm[base + idx] = conv0_weight_v[base + idx] * scale;
-        }
-    }
-
-    // Normalize weights for ConvTranspose1d layer 3: [C_in: 512, C_out: 256, K: 16]
     const C3_IN = 512;
     const C3_OUT = 256;
     const K3 = 16;
     const STRIDE3 = 8;
     const conv3_weight_norm = try allocator.alloc(f32, C3_IN * C3_OUT * K3);
-
     for (0..C3_IN) |ci| {
         var norm_sq: f32 = 0.0;
         const slice_len = C3_OUT * K3;
@@ -333,6 +353,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const l4_b1_norm = try normalizeConv1dWeights(allocator, l4_b1_v, l4_b1_g, 128, 256, 3);
+    const l4_b3_norm = try normalizeConv1dWeights(allocator, l4_b3_v, l4_b3_g, 256, 128, 1);
+    const l4_sc_norm = try normalizeConv1dWeights(allocator, l4_sc_v, l4_sc_g, 256, 256, 1);
+
     // 5. Decode tokens into latents [128, 4]
     var sequence_tokens = [_][8]u16{
         [_]u16{ 120, 450, 89, 730, 210, 95, 600, 314 },
@@ -345,11 +369,11 @@ pub fn main(init: std.process.Init) !void {
     var latents: [128 * 4]f32 = undefined;
     decodeRVQSequence(&codebooks, &sequence_tokens, num_frames, &latents);
 
-    // 6. Run Conv1d: [128, 4] -> [512, 4]
+    // 6. Layer 0 (Conv1d): [128, 4] -> [512, 4]
     const conv_out = try allocator.alloc(f32, C0_OUT * num_frames);
     conv1dSame(&latents, C0_IN, num_frames, conv0_weight_norm, conv0_bias[0..C0_OUT], C0_OUT, K0, conv_out);
 
-    // 7. Run 2-Layer LSTM: [512, 4] -> [512, 4]
+    // 7. Layer 1 (2-Layer LSTM): [512, 4] -> [512, 4]
     const lstm_l0_out = try allocator.alloc(f32, C0_OUT * num_frames);
     const lstm_l1_out = try allocator.alloc(f32, C0_OUT * num_frames);
     const h_buf = try allocator.alloc(f32, C0_OUT);
@@ -360,25 +384,46 @@ pub fn main(init: std.process.Init) !void {
     @memset(c_buf, 0.0);
     runLstmLayer(lstm_l0_out, lstm_l1_out, C0_OUT, num_frames, l1_w_ih, l1_w_hh, l1_b_ih, l1_b_hh, h_buf, c_buf);
 
-    // 8. Apply ELU activation (Layer 2)
+    // 8. Layer 2 (ELU)
     for (lstm_l1_out) |*val| {
         val.* = elu(val.*);
     }
 
-    // 9. Run ConvTranspose1d (Layer 3): [512, 4] -> [256, 32]
-    const t_upsampled = num_frames * STRIDE3;
-    const conv3_out = try allocator.alloc(f32, C3_OUT * t_upsampled);
+    // 9. Layer 3 (ConvTranspose1d): [512, 4] -> [256, 32]
+    const t_up1 = num_frames * STRIDE3;
+    const conv3_out = try allocator.alloc(f32, C3_OUT * t_up1);
     convTranspose1d(lstm_l1_out, C3_IN, num_frames, conv3_weight_norm, conv3_bias[0..C3_OUT], C3_OUT, K3, STRIDE3, conv3_out);
 
-    // 10. Inspect output
+    // 10. Layer 4 (ResNet Block): [256, 32] -> [256, 32]
+    const l4_mid = try allocator.alloc(f32, 128 * t_up1);
+    const l4_res = try allocator.alloc(f32, 256 * t_up1);
+    const l4_sc = try allocator.alloc(f32, 256 * t_up1);
+    const l4_out = try allocator.alloc(f32, 256 * t_up1);
+
+    // Shortcut path: 1x1 Conv
+    conv1dSame(conv3_out, 256, t_up1, l4_sc_norm, l4_sc_bias[0..256], 256, 1, l4_sc);
+
+    // Residual path: 3x1 Conv -> ELU -> 1x1 Conv
+    conv1dSame(conv3_out, 256, t_up1, l4_b1_norm, l4_b1_bias[0..128], 128, 3, l4_mid);
+    for (l4_mid) |*val| {
+        val.* = elu(val.*);
+    }
+    conv1dSame(l4_mid, 128, t_up1, l4_b3_norm, l4_b3_bias[0..256], 256, 1, l4_res);
+
+    // Accumulate shortcut + residual
+    for (0..256 * t_up1) |idx| {
+        l4_out[idx] = l4_sc[idx] + l4_res[idx];
+    }
+
+    // 11. Inspect output
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Successfully computed Layer 3 ConvTranspose1d ([512, {d}] -> [256, {d}]).\n", .{ num_frames, t_upsampled });
-    try stdout.print("Upsampled Channel 0 across first 8 timesteps: ", .{});
+    try stdout.print("Successfully computed Layer 4 ResNet block ([256, {d}] -> [256, {d}]).\n", .{ t_up1, t_up1 });
+    try stdout.print("ResNet Block Output Channel 0 across first 8 timesteps: ", .{});
     for (0..8) |t| {
-        try stdout.print("{d:.4} ", .{conv3_out[0 * t_upsampled + t]});
+        try stdout.print("{d:.4} ", .{l4_out[0 * t_up1 + t]});
     }
     try stdout.writeByte('\n');
     try stdout.flush();
