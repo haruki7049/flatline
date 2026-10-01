@@ -1,7 +1,8 @@
 .direnv/
 
 src/weights/*.safetensors
-src/weights/*.bin
+*.bin
+*.wav
 
 .zig-cache/
 zig-out/
