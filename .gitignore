@@ -2,3 +2,6 @@
 
 src/weights/*.safetensors
 src/weights/*.bin
+
+.zig-cache/
+zig-out/
