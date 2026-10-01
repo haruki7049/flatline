@@ -73,8 +73,13 @@ fn tanhActivation(x: f32) f32 {
     return std.math.tanh(x);
 }
 
+// ELU activation: x if x > 0 else (exp(x) - 1)
+fn elu(x: f32) f32 {
+    if (x > 0.0) return x;
+    return @exp(x) - 1.0;
+}
+
 // Unidirectional LSTM across time dimension
-// in: [H, T], out: [H, T] where H = 512
 pub fn runLstmLayer(
     in: []const f32,
     out: []f32,
@@ -91,7 +96,6 @@ pub fn runLstmLayer(
     @memset(c_state, 0.0);
 
     for (0..t_len) |t| {
-        // Compute all 4 gates for all dimensions
         for (0..h_dim) |d| {
             var pre_i = b_ih[d] + b_hh[d];
             var pre_f = b_ih[h_dim + d] + b_hh[h_dim + d];
@@ -130,9 +134,56 @@ pub fn runLstmLayer(
             c_state[d] = next_c;
         }
 
-        // Advance hidden state to t+1
         for (0..h_dim) |d| {
             h_state[d] = out[d * t_len + t];
+        }
+    }
+}
+
+// 1D Transposed Convolution (Upsampling)
+// Input:  [C_in, T_in]
+// Weight: [C_in, C_out, K]
+// Bias:   [C_out]
+// Output: [C_out, T_out] where T_out = T_in * stride
+pub fn convTranspose1d(
+    in: []const f32,
+    c_in: usize,
+    t_in: usize,
+    weight: []const f32,
+    bias: []const f32,
+    c_out: usize,
+    kernel_size: usize,
+    stride: usize,
+    out: []f32,
+) void {
+    const t_out = t_in * stride;
+    const pad = (kernel_size - stride) / 2;
+
+    // Initialize with bias
+    for (0..c_out) |co| {
+        const bias_val = bias[co];
+        for (0..t_out) |to| {
+            out[co * t_out + to] = bias_val;
+        }
+    }
+
+    // Accumulate kernel contributions
+    for (0..c_in) |ci| {
+        for (0..c_out) |co| {
+            const w_base = ci * (c_out * kernel_size) + co * kernel_size;
+            const w_slice = weight[w_base .. w_base + kernel_size];
+
+            for (0..t_in) |ti| {
+                const in_val = in[ci * t_in + ti];
+                if (in_val == 0.0) continue;
+
+                for (0..kernel_size) |k| {
+                    const out_time = @as(isize, @intCast(ti * stride + k)) - @as(isize, @intCast(pad));
+                    if (out_time >= 0 and out_time < @as(isize, @intCast(t_out))) {
+                        out[co * t_out + @as(usize, @intCast(out_time))] += in_val * w_slice[k];
+                    }
+                }
+            }
         }
     }
 }
@@ -217,13 +268,9 @@ pub fn main(init: std.process.Init) !void {
     }.run;
 
     // Layer 0 weights (Conv1d)
-    const bias_offset = try get_offset(root, "decoder.layers.0.conv.bias");
-    const weight_v_offset = try get_offset(root, "decoder.layers.0.conv.weight_v");
-    const weight_g_offset = try get_offset(root, "decoder.layers.0.conv.weight_g");
-
-    const conv0_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + bias_offset ..].ptr));
-    const conv0_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + weight_v_offset ..].ptr));
-    const conv0_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + weight_g_offset ..].ptr));
+    const conv0_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.0.conv.bias") ..].ptr));
+    const conv0_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.0.conv.weight_v") ..].ptr));
+    const conv0_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.0.conv.weight_g") ..].ptr));
 
     // Layer 1 weights (2-Layer LSTM)
     const l0_w_ih = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.weight_ih_l0") ..].ptr)));
@@ -236,15 +283,20 @@ pub fn main(init: std.process.Init) !void {
     const l1_b_ih = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.bias_ih_l1") ..].ptr)));
     const l1_b_hh = @as([*]const f32, @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.1.lstm.bias_hh_l1") ..].ptr)));
 
-    // Normalize weights for Conv1d layer 0
-    const C_OUT = 512;
-    const C_IN = 128;
-    const K = 7;
-    const weight_norm = try allocator.alloc(f32, C_OUT * C_IN * K);
+    // Layer 3 weights (ConvTranspose1d)
+    const conv3_bias: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.3.conv.bias") ..].ptr));
+    const conv3_weight_v: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.3.conv.weight_v") ..].ptr));
+    const conv3_weight_g: [*]const f32 = @ptrCast(@alignCast(mapped[payload_start + try get_offset(root, "decoder.layers.3.conv.weight_g") ..].ptr));
 
-    for (0..C_OUT) |co| {
+    // Normalize weights for Conv1d layer 0
+    const C0_OUT = 512;
+    const C0_IN = 128;
+    const K0 = 7;
+    const conv0_weight_norm = try allocator.alloc(f32, C0_OUT * C0_IN * K0);
+
+    for (0..C0_OUT) |co| {
         var norm_sq: f32 = 0.0;
-        const slice_len = C_IN * K;
+        const slice_len = C0_IN * K0;
         const base = co * slice_len;
 
         for (0..slice_len) |idx| {
@@ -254,7 +306,30 @@ pub fn main(init: std.process.Init) !void {
 
         const scale = conv0_weight_g[co] / @sqrt(norm_sq);
         for (0..slice_len) |idx| {
-            weight_norm[base + idx] = conv0_weight_v[base + idx] * scale;
+            conv0_weight_norm[base + idx] = conv0_weight_v[base + idx] * scale;
+        }
+    }
+
+    // Normalize weights for ConvTranspose1d layer 3: [C_in: 512, C_out: 256, K: 16]
+    const C3_IN = 512;
+    const C3_OUT = 256;
+    const K3 = 16;
+    const STRIDE3 = 8;
+    const conv3_weight_norm = try allocator.alloc(f32, C3_IN * C3_OUT * K3);
+
+    for (0..C3_IN) |ci| {
+        var norm_sq: f32 = 0.0;
+        const slice_len = C3_OUT * K3;
+        const base = ci * slice_len;
+
+        for (0..slice_len) |idx| {
+            const val = conv3_weight_v[base + idx];
+            norm_sq += val * val;
+        }
+
+        const scale = conv3_weight_g[ci] / @sqrt(norm_sq);
+        for (0..slice_len) |idx| {
+            conv3_weight_norm[base + idx] = conv3_weight_v[base + idx] * scale;
         }
     }
 
@@ -271,33 +346,39 @@ pub fn main(init: std.process.Init) !void {
     decodeRVQSequence(&codebooks, &sequence_tokens, num_frames, &latents);
 
     // 6. Run Conv1d: [128, 4] -> [512, 4]
-    const conv_out = try allocator.alloc(f32, C_OUT * num_frames);
-    conv1dSame(&latents, C_IN, num_frames, weight_norm, conv0_bias[0..C_OUT], C_OUT, K, conv_out);
+    const conv_out = try allocator.alloc(f32, C0_OUT * num_frames);
+    conv1dSame(&latents, C0_IN, num_frames, conv0_weight_norm, conv0_bias[0..C0_OUT], C0_OUT, K0, conv_out);
 
     // 7. Run 2-Layer LSTM: [512, 4] -> [512, 4]
-    const lstm_l0_out = try allocator.alloc(f32, C_OUT * num_frames);
-    const lstm_l1_out = try allocator.alloc(f32, C_OUT * num_frames);
-    const h_buf = try allocator.alloc(f32, C_OUT);
-    const c_buf = try allocator.alloc(f32, C_OUT);
+    const lstm_l0_out = try allocator.alloc(f32, C0_OUT * num_frames);
+    const lstm_l1_out = try allocator.alloc(f32, C0_OUT * num_frames);
+    const h_buf = try allocator.alloc(f32, C0_OUT);
+    const c_buf = try allocator.alloc(f32, C0_OUT);
 
-    runLstmLayer(conv_out, lstm_l0_out, C_OUT, num_frames, l0_w_ih, l0_w_hh, l0_b_ih, l0_b_hh, h_buf, c_buf);
+    runLstmLayer(conv_out, lstm_l0_out, C0_OUT, num_frames, l0_w_ih, l0_w_hh, l0_b_ih, l0_b_hh, h_buf, c_buf);
     @memset(h_buf, 0.0);
     @memset(c_buf, 0.0);
-    runLstmLayer(lstm_l0_out, lstm_l1_out, C_OUT, num_frames, l1_w_ih, l1_w_hh, l1_b_ih, l1_b_hh, h_buf, c_buf);
+    runLstmLayer(lstm_l0_out, lstm_l1_out, C0_OUT, num_frames, l1_w_ih, l1_w_hh, l1_b_ih, l1_b_hh, h_buf, c_buf);
 
-    // 8. Inspect output
+    // 8. Apply ELU activation (Layer 2)
+    for (lstm_l1_out) |*val| {
+        val.* = elu(val.*);
+    }
+
+    // 9. Run ConvTranspose1d (Layer 3): [512, 4] -> [256, 32]
+    const t_upsampled = num_frames * STRIDE3;
+    const conv3_out = try allocator.alloc(f32, C3_OUT * t_upsampled);
+    convTranspose1d(lstm_l1_out, C3_IN, num_frames, conv3_weight_norm, conv3_bias[0..C3_OUT], C3_OUT, K3, STRIDE3, conv3_out);
+
+    // 10. Inspect output
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Successfully computed 2-Layer LSTM ([512, {d}] -> [512, {d}]).\n", .{ num_frames, num_frames });
-    try stdout.print("LSTM Layer 1 Channel 0 across 4 frames: ", .{});
-    for (0..num_frames) |t| {
-        try stdout.print("{d:.4} ", .{lstm_l1_out[0 * num_frames + t]});
-    }
-    try stdout.print("\nLSTM Layer 1 Channel 1 across 4 frames: ", .{});
-    for (0..num_frames) |t| {
-        try stdout.print("{d:.4} ", .{lstm_l1_out[1 * num_frames + t]});
+    try stdout.print("Successfully computed Layer 3 ConvTranspose1d ([512, {d}] -> [256, {d}]).\n", .{ num_frames, t_upsampled });
+    try stdout.print("Upsampled Channel 0 across first 8 timesteps: ", .{});
+    for (0..8) |t| {
+        try stdout.print("{d:.4} ", .{conv3_out[0 * t_upsampled + t]});
     }
     try stdout.writeByte('\n');
     try stdout.flush();
