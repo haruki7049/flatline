@@ -113,7 +113,11 @@ const is_silence = (header.reserved == 0);
 2. **Coarse**: `bark_model.coarse_acoustics.generate` で semantic → coarse acoustic トークン。
 3. **Fine**: `bark_model.fine_acoustics.generate` で coarse → fine acoustic トークン（= EnCodec 8-stage トークン）。
 
-各段とも `temperature = 0.2` で `do_sample = True`（Fine 段は `BarkFineGenerationConfig` 既定 + `temperature=0.2` を明示指定）とし、感情的な抑揚・ばらつきの少ない平坦な出力に寄せる。各段の `GenerationConfig`（`SEMANTIC_GEN_CONFIG` / `COARSE_GEN_CONFIG` / `FINE_GEN_CONFIG`）はモジュールロード時に 1 回だけ構築し、発話のたびに作り直さない。
+各段とも `temperature = 0.2`（Semantic/Coarse は `do_sample = True`）とし、感情的な抑揚・ばらつきの少ない平坦な出力に寄せる。各段の `GenerationConfig`（`SEMANTIC_GEN_CONFIG` / `COARSE_GEN_CONFIG` / `FINE_GEN_CONFIG`）はモジュールロード時に 1 回だけ構築し、発話のたびに作り直さない。
+
+**生成長の上限**: Bark-small の Semantic 段はデフォルトで `max_new_tokens=768`（Semantic レート ~49Hz 換算で 10 秒超）まで生成し得るが、固定応答フレーズは 1〜5 単語の短文しかない。`SEMANTIC_MAX_NEW_TOKENS = 96` でこれを明示的に絞り込み、Semantic 系列長を基準に決まる Coarse/Fine の生成長も連動して短縮する。各段の config 辞書からは競合の原因になる `max_length` を取り除き（`max_new_tokens` のみで上限を管理）、Fine 段の `generate` 呼び出しでは `fine_generation_config` と重複する `temperature` kwarg を渡さないようにした。これにより `transformers` の `Both 'max_new_tokens' and 'max_length' seem to have been set.` / `Passing 'generation_config' together with generation-related arguments... is deprecated` という警告の連打を解消している。
+
+**末尾無音のトリム**: `codec.decode` で復元した PCM に対し、`trim_trailing_silence`（20ms フレーム単位の RMS がしきい値 `0.01` を下回る末尾を切り捨てる簡易処理）を適用してから再生する。
 
 ### 4.3 処理フロー
 
@@ -124,7 +128,7 @@ const is_silence = (header.reserved == 0);
 ### 4.4 既知の制約
 
 - 入力音声の文字起こしも、聞いた内容に基づくテキスト生成も行っていない。応答は発話内容に関わらず固定候補からのランダム選択であり、「オウム返し」から「固定文の読み上げ」になっただけで、対話としての思考層はまだ存在しない（§5.2 のロードマップ）。
-- Bark-small の 3 段階生成（Semantic → Coarse → Fine）は数百 ms〜数秒オーダーの推論コストがあり、発話確定から応答再生開始までの遅延（レイテンシ）は旧来のエコーバックより大きい。
+- Bark-small の 3 段階生成（Semantic → Coarse → Fine）は数百 ms〜数秒オーダーの推論コストがあり、発話確定から応答再生開始までの遅延（レイテンシ）は旧来のエコーバックより大きい（`SEMANTIC_MAX_NEW_TOKENS` の調整で短縮済みだが、ゼロにはならない）。
 
 ## 5. 現在の技術的課題と次のアプローチ
 
