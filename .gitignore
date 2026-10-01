@@ -1,2 +1,4 @@
+.direnv/
+
 weights/*.safetensors
 weights/*.bin
