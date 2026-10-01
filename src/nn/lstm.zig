@@ -106,7 +106,8 @@ pub const LstmLayer = struct {
     }
 };
 
-/// Stack of `num_layers` LSTM layers, each fed by the previous one.
+/// Stack of `num_layers` LSTM layers, each fed by the previous one, with a residual
+/// connection around the whole stack (EnCodec's SLSTM: output = lstm(x) + x).
 pub fn Lstm(comptime num_layers: usize) type {
     return struct {
         const Self = @This();
@@ -126,7 +127,7 @@ pub fn Lstm(comptime num_layers: usize) type {
             return self.layers[0].hidden_size;
         }
 
-        /// `in` and `out` are [hidden, t_len].
+        /// `in` and `out` are [hidden, t_len] and must not alias.
         pub fn forward(self: Self, allocator: Allocator, in: []const f32, t_len: usize, out: []f32) !void {
             const h_dim = self.hiddenSize();
 
@@ -148,6 +149,11 @@ pub fn Lstm(comptime num_layers: usize) type {
                     scratch[(i % 2) * h_dim * t_len ..][0 .. h_dim * t_len];
                 layer.forward(src, t_len, dst, h_state, c_state);
                 src = dst;
+            }
+
+            // Residual skip
+            for (out, in) |*o, x| {
+                o.* += x;
             }
         }
     };
@@ -178,7 +184,7 @@ test "LstmLayer with zero weights follows the gate equations" {
     try std.testing.expectApproxEqAbs(o * activation.tanh(c1), out[1], 1e-6);
 }
 
-test "Lstm stacks layers" {
+test "Lstm stacks layers and adds the input" {
     const p: LstmParams = .{
         .weight_ih = &.{ 0.0, 0.0, 0.0, 1.0 },
         .weight_hh = &.{ 0.0, 0.0, 0.0, 0.0 },
@@ -191,7 +197,7 @@ test "Lstm stacks layers" {
     var stacked: [2]f32 = undefined;
     try stack.forward(std.testing.allocator, &in, 2, &stacked);
 
-    // Same result as running the layers one by one
+    // Same result as running the layers one by one, plus the input
     var a: [2]f32 = undefined;
     var b: [2]f32 = undefined;
     var h: [1]f32 = undefined;
@@ -199,6 +205,7 @@ test "Lstm stacks layers" {
     stack.layers[0].forward(&in, 2, &a, &h, &c);
     stack.layers[1].forward(&a, 2, &b, &h, &c);
     stack.layers[2].forward(&b, 2, &a, &h, &c);
+    for (&a, in) |*o, x| o.* += x;
     try std.testing.expectEqualSlices(f32, &a, &stacked);
 }
 

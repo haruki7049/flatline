@@ -38,7 +38,8 @@ fn weightNorm(allocator: Allocator, p: WeightNormParams) ![]f32 {
     return norm;
 }
 
-/// 1D convolution with stride 1 and "same" zero padding.
+/// Causal 1D convolution with stride 1, matching EnCodec's SConv1d (causal=True,
+/// pad_mode='reflect'): the input is reflect-padded by kernel_size - 1 on the left only.
 /// Tensors are channel-major: [channels, time].
 pub const Conv1d = struct {
     /// [c_out, c_in, kernel_size]
@@ -71,7 +72,7 @@ pub const Conv1d = struct {
 
         const c_in = self.c_in;
         const kernel_size = self.kernel_size;
-        const pad = kernel_size / 2;
+        const pad = kernel_size - 1;
 
         for (0..self.c_out) |co| {
             const bias_val = self.bias[co];
@@ -85,10 +86,12 @@ pub const Conv1d = struct {
                     const w_channel = w_co[ci * kernel_size .. (ci + 1) * kernel_size];
 
                     for (0..kernel_size) |k| {
-                        const in_t = @as(isize, @intCast(t)) + @as(isize, @intCast(k)) - @as(isize, @intCast(pad));
-                        if (in_t >= 0 and in_t < @as(isize, @intCast(t_len))) {
-                            sum += in_channel[@as(usize, @intCast(in_t))] * w_channel[k];
-                        }
+                        // Position in the padded input is t + k; the first `pad` samples are padding.
+                        const in_val = if (t + k >= pad)
+                            in_channel[t + k - pad]
+                        else
+                            reflectLeft(in_channel, pad - (t + k));
+                        sum += in_val * w_channel[k];
                     }
                 }
 
@@ -98,7 +101,15 @@ pub const Conv1d = struct {
     }
 };
 
-/// 1D transposed convolution (upsampling by `stride`).
+// Value of the left reflect padding `distance` samples before the first sample (x[distance]).
+// Like EnCodec's pad1d, an input too short to reflect is first extended with zeros on the right.
+fn reflectLeft(x: []const f32, distance: usize) f32 {
+    return if (distance < x.len) x[distance] else 0.0;
+}
+
+/// Causal 1D transposed convolution (upsampling by `stride`), matching EnCodec's
+/// SConvTranspose1d (causal=True, trim_right_ratio=1.0): the kernel_size - stride
+/// surplus samples are trimmed from the right end.
 /// Tensors are channel-major: [channels, time].
 pub const ConvTranspose1d = struct {
     /// [c_in, c_out, kernel_size]
@@ -137,7 +148,6 @@ pub const ConvTranspose1d = struct {
         const kernel_size = self.kernel_size;
         const stride = self.stride;
         const t_out = self.outputLen(t_in);
-        const pad = (kernel_size - stride) / 2;
 
         std.debug.assert(in.len == self.c_in * t_in);
         std.debug.assert(out.len == c_out * t_out);
@@ -159,10 +169,9 @@ pub const ConvTranspose1d = struct {
                     if (in_val == 0.0) continue;
 
                     for (0..kernel_size) |k| {
-                        const out_time = @as(isize, @intCast(ti * stride + k)) - @as(isize, @intCast(pad));
-                        if (out_time >= 0 and out_time < @as(isize, @intCast(t_out))) {
-                            out[co * t_out + @as(usize, @intCast(out_time))] += in_val * w_slice[k];
-                        }
+                        const out_time = ti * stride + k;
+                        if (out_time >= t_out) break;
+                        out[co * t_out + out_time] += in_val * w_slice[k];
                     }
                 }
             }
@@ -190,7 +199,7 @@ test "weight norm rejects mismatched shapes" {
     }));
 }
 
-test "Conv1d uses same padding" {
+test "Conv1d reflect-pads on the left only" {
     // Single channel, kernel [1, 1, 1] (norm sqrt(3), gain sqrt(3)) is a 3-tap moving sum.
     const conv = try Conv1d.initWeightNorm(std.testing.allocator, .{
         .weight_v = &.{ 1.0, 1.0, 1.0 },
@@ -200,11 +209,36 @@ test "Conv1d uses same padding" {
     });
     defer conv.deinit(std.testing.allocator);
 
+    // Padded input: [3, 2 | 1, 2, 3, 4]
     const in = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     var out: [4]f32 = undefined;
     conv.forward(&in, 4, &out);
+    const expected = [_]f32{ 6.5, 5.5, 6.5, 9.5 };
+    for (expected, out) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
 
-    const expected = [_]f32{ 3.5, 6.5, 9.5, 7.5 };
+    // Too short to reflect: [1, 2] is extended to [1, 2, 0], so the padded input is [0, 2 | 1, 2]
+    const short = [_]f32{ 1.0, 2.0 };
+    var short_out: [2]f32 = undefined;
+    conv.forward(&short, 2, &short_out);
+    const short_expected = [_]f32{ 3.5, 5.5 };
+    for (short_expected, short_out) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+}
+
+test "ConvTranspose1d trims the surplus from the right" {
+    // kernel [1, 1, 1, 1] with stride 2: the full output [1, 1, 11, 11, 10, 10] loses its last 2 samples.
+    const conv = try ConvTranspose1d.initWeightNorm(std.testing.allocator, .{
+        .weight_v = &.{ 1.0, 1.0, 1.0, 1.0 },
+        .weight_g = &.{2.0},
+        .bias = &.{0.0},
+        .shape = .{ 1, 1, 4 },
+    }, 2);
+    defer conv.deinit(std.testing.allocator);
+
+    const in = [_]f32{ 1.0, 10.0 };
+    var out: [4]f32 = undefined;
+    conv.forward(&in, 2, &out);
+
+    const expected = [_]f32{ 1.0, 1.0, 11.0, 11.0 };
     for (expected, out) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
 }
 

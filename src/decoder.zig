@@ -1,4 +1,5 @@
-//! EnCodec 24 kHz decoder: RVQ tokens -> latents -> SEANet decoder -> PCM.
+//! EnCodec 24 kHz decoder: RVQ tokens -> latents -> causal SEANet decoder -> PCM.
+//! Follows encodec.modules.seanet.SEANetDecoder with causal=True, pad_mode='reflect'.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -110,12 +111,12 @@ pub const Decoder = struct {
         defer allocator.free(latents);
         try self.quantizer.decode(frames, latents);
 
-        // Layer 0 (Conv1d): [128, T] -> [512, T]
+        // Layer 0 (causal Conv1d): [128, T] -> [512, T]
         const conv_in_out = try allocator.alloc(f32, self.conv_in.c_out * t_len);
         defer allocator.free(conv_in_out);
         self.conv_in.forward(latents, t_len, conv_in_out);
 
-        // Layer 1 (2-Layer LSTM) and Layer 2 (ELU): [512, T] -> [512, T]
+        // Layer 1 (2-Layer LSTM + skip) and Layer 2 (ELU): [512, T] -> [512, T]
         var x = try allocator.alloc(f32, self.lstm.hiddenSize() * t_len);
         defer allocator.free(x);
         try self.lstm.forward(allocator, conv_in_out, t_len, x);
@@ -139,7 +140,7 @@ pub const Decoder = struct {
             t_len = up_len;
         }
 
-        // Layer 15 (Final Conv1d): [32, T'] -> [1, T']
+        // Layer 15 (Final causal Conv1d): [32, T'] -> [1, T']
         const audio = try allocator.alloc(f32, self.conv_out.c_out * t_len);
         self.conv_out.forward(x, t_len, audio);
         return audio;
