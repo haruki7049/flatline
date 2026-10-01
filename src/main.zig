@@ -5,9 +5,8 @@ pub fn decodeRVQSequence(
     codebooks: []const [*]const f32,
     tokens: []const [8]u16,
     num_frames: usize,
-    out_latents: []f32, // Size must be 128 * num_frames
+    out_latents: []f32,
 ) void {
-    // Channel-first layout: [128, T] for subsequent 1D-CNN convolutions
     for (0..128) |c| {
         for (0..num_frames) |t| {
             out_latents[c * num_frames + t] = 0.0;
@@ -21,15 +20,6 @@ pub fn decodeRVQSequence(
             for (0..128) |c| {
                 out_latents[c * num_frames + t] += base_ptr[c];
             }
-        }
-    }
-}
-
-// Neutralizes acoustic dynamics by clamping higher stages across all frames
-pub fn neutralizeSequence(tokens: [][8]u16) void {
-    for (tokens) |*frame| {
-        for (2..8) |stage| {
-            frame[stage] = 0;
         }
     }
 }
@@ -60,6 +50,23 @@ pub fn main(init: std.process.Init) !void {
     const header_len = std.mem.readInt(u64, mapped[0..8], .little);
     if (header_len > mapped.len - 8) return error.InvalidFile;
     const header_json = mapped[8 .. 8 + header_len];
+
+    // Check command line arguments for header dump mode
+    var args = init.minimal.args;
+    var args_iterator = args.iterate();
+    _ = args_iterator.next(); // Skip binary name
+    if (args_iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--dump-header")) {
+            var buffer: [1024]u8 = undefined;
+            var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
+            const stdout = &stdout_writer.interface;
+            try stdout.writeAll(header_json);
+            try stdout.writeByte('\n');
+            try stdout.flush();
+            return;
+        }
+    }
+
     const payload_start = 8 + header_len;
 
     // 4. Parse JSON metadata to dynamically extract codebook offsets
@@ -77,7 +84,6 @@ pub fn main(init: std.process.Init) !void {
 
     const root = parsed.value.object;
 
-    // Collect 8 codebook pointers (stages 0 to 7)
     const NUM_STAGES = 8;
     var codebooks: [NUM_STAGES][*]const f32 = undefined;
 
@@ -93,21 +99,18 @@ pub fn main(init: std.process.Init) !void {
         codebooks[stage] = @ptrCast(@alignCast(mapped[tensor_start..].ptr));
     }
 
-    // 5. Simulate 4 frames of token sequence (approx. 53ms of audio)
+    // 5. Decode 4 frames
     var sequence_tokens = [_][8]u16{
         [_]u16{ 120, 450, 89, 730, 210, 95, 600, 314 },
         [_]u16{ 121, 448, 88, 729, 212, 94, 599, 310 },
         [_]u16{ 125, 440, 92, 735, 205, 99, 605, 320 },
         [_]u16{ 130, 435, 95, 740, 200, 102, 610, 325 },
     };
-
     const num_frames = sequence_tokens.len;
 
-    // Allocate continuous latent memory: [128, T]
     var latents: [128 * 4]f32 = undefined;
     decodeRVQSequence(&codebooks, &sequence_tokens, num_frames, &latents);
 
-    // 6. Inspect sequence reconstruction
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
