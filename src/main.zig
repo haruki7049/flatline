@@ -16,6 +16,15 @@ pub fn decodeRVQFrame(
     }
 }
 
+// Neutralizes acoustic dynamics by clamping higher stages
+pub fn neutralizeAcoustics(tokens: *[8]u16) void {
+    // Keep Stage 0 and 1 (linguistic content)
+    // Clamp Stage 2 to 7 to constant neutral index
+    for (2..8) |stage| {
+        tokens[stage] = 0;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const file_path = "src/weights/encodec_24khz.safetensors";
@@ -75,21 +84,35 @@ pub fn main(init: std.process.Init) !void {
         codebooks[stage] = @ptrCast(@alignCast(mapped[tensor_start..].ptr));
     }
 
-    // 5. Test RVQ decoding with dummy tokens
-    const dummy_tokens = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 };
-    var latent: [128]f32 = undefined;
+    // 5. Compare expressive tokens vs clamped tokens
+    var dynamic_tokens = [_]u16{ 120, 450, 89, 730, 210, 95, 600, 314 };
+    var clamped_tokens = dynamic_tokens;
+    neutralizeAcoustics(&clamped_tokens);
 
-    decodeRVQFrame(&codebooks, &dummy_tokens, &latent);
+    var latent_dynamic: [128]f32 = undefined;
+    var latent_clamped: [128]f32 = undefined;
 
-    // 6. Inspect resulting latent vector
+    decodeRVQFrame(&codebooks, &dynamic_tokens, &latent_dynamic);
+    decodeRVQFrame(&codebooks, &clamped_tokens, &latent_clamped);
+
+    // 6. Inspect output difference
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Successfully parsed {d} RVQ stages.\n", .{NUM_STAGES});
-    try stdout.print("Decoded latent frame (first 8 dimensions):\n", .{});
+    try stdout.print("Dynamic Tokens: {any}\n", .{dynamic_tokens});
+    try stdout.print("Clamped Tokens: {any}\n\n", .{clamped_tokens});
+
+    try stdout.print("Dim |  Dynamic   |  Clamped   |  Delta\n", .{});
+    try stdout.print("----+------------+------------+------------\n", .{});
     for (0..8) |d| {
-        try stdout.print("  out[{d}] = {d:.6}\n", .{ d, latent[d] });
+        const delta = latent_dynamic[d] - latent_clamped[d];
+        try stdout.print(" {d}  | {d:10.5} | {d:10.5} | {d:10.5}\n", .{
+            d,
+            latent_dynamic[d],
+            latent_clamped[d],
+            delta,
+        });
     }
     try stdout.flush();
 }
