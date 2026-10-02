@@ -59,6 +59,18 @@ pub fn build(b: *std.Build) void {
     run_capture_cmd.setCwd(b.path("."));
     run_capture_cmd.step.dependOn(b.getInstallStep());
     run_capture_step.dependOn(&run_capture_cmd.step);
+
+    // receiver executable
+    const receiver_module = b.createModule(.{
+        .root_source_file = b.path("src/receiver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const receiver_exe = b.addExecutable(.{
+        .name = "receiver",
+        .root_module = receiver_module,
+    });
+    b.installArtifact(receiver_exe);
 }
 
 /// Builds an executable that links zaudio/miniaudio, with the macOS framework
