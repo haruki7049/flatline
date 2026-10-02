@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x8b39e45acd1144b4, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zaudio = .{
+            .url = "git+https://github.com/zig-gamedev/zaudio#fed501100b029213898861b60c6b54f8121dff03",
+            .hash = "zaudio-0.11.0-dev-_M-91iAzQQCTA0NTL2NJsB1qm6kMRrMWRQApIuyX-1Im",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -4,9 +4,9 @@
 
 ## 設計思想
 
-- **一時的な推論スキャフォールドとしての Python**: EnCodec のようなモデル推論は、現段階では PyTorch (MPS 加速) 上の Python スクリプトで済ませる。
-- **コアは Zig**: 音声 I/O、VAD（発話区間検出）、状態遷移、プロセス間同期は Zig (`src/`) で実装する。
-- **最終目標**: Python スキャフォールドを排除し、Apple Silicon 上でネイティブ動作する単一バイナリに統合する。EnCodec のエンコード/デコード自体は既に Zig (`src/encoder.zig`, `src/decoder.zig`, `src/model.zig` の SafeTensors ローダ経由) に移植済みで、現状 Python 側に残っているのは主にマイク入出力 (`sounddevice`) とストリーミング制御。
+- **一時的な推論スキャフォールドとしての Python**: 重いモデル推論（Bark-small による応答音声の事前生成など）は、実行時パイプラインの外側、ビルド時ツール (`python/experiments/build_response_assets.py`) に限定する。
+- **コアは Zig**: 音声 I/O、VAD（発話区間検出）、状態遷移、プロセス間同期、そして応答再生そのものを Zig (`src/`) で実装する。
+- **最終目標**: Python スキャフォールドを排除し、Apple Silicon 上でネイティブ動作する単一バイナリに統合する。EnCodec のエンコード/デコード自体は既に Zig (`src/encoder.zig`, `src/decoder.zig`, `src/model.zig` の SafeTensors ローダ経由) に移植済み。実行時パイプラインのマイク入力 (`python/pipeline/stream_mic_encoder.py`) は依然 Python だが、応答再生側 (`./player`, `src/player.zig`) は [zaudio](https://github.com/zig-gamedev/zaudio) によるネイティブ実装に置き換わり、Python/torch への実行時依存は無くなった。
 
 ## アーキテクチャ
 
@@ -28,16 +28,16 @@ python/pipeline/stream_mic_encoder.py
     一括りにまとめて次段へ転送
      │ stdout → stdin (パイプ)
      ▼
-python/pipeline/stream_decoder.py
+./player (src/player.zig, zig build) — ネイティブ実装、Python なし
   - 受け取った生 PCM の中身は使わず、「発話確定」を応答トリガーとしてのみ
-    扱う（エコーバックは廃止）。torch/transformers/Bark はロードしない
-  - 起動時に assets/responses/manifest.json 記載の .wav を全てメモリに
-    キャッシュしておき、確定時にランダムに1件選んで即座に再生するだけ
-  - sounddevice でスピーカーへ再生。コミットから再生開始までのレイテンシを
-    time.perf_counter() で計測して stderr にログ出力
+    扱う（エコーバックは廃止）
+  - 起動時に assets/responses/manifest.json 記載の .wav を全て読み込み、
+    zaudio (miniaudio) の AudioBuffer/Sound としてメモリに保持
+  - 確定時にランダムに1件選んで zaudio 経由でそのまま再生。
+    コミットから再生開始(Sound.start())までのレイテンシを計測して stderr に出力
 ```
 
-40ms チャンク単位で EnCodec 推論をかけていた旧方式はチャンク境界で歪み・かすれ音が生じていたため、「発話が確定するまでは生 PCM のまま中継する」方式に変更済み（詳細は [docs/architecture.md](docs/architecture.md) §1.3, §5.1）。`stream_decoder.py` は、受け取った音声をそのまま読み上げるエコーバックから、発話確定をトリガーに固定・短文の冷淡な応答を再生するプロトタイプへ置き換えた上で、さらに実行時の Bark 推論自体を撤廃し、`python/experiments/build_response_assets.py` でビルド時に事前生成した応答音声を即時再生する「超低遅延トークンルーター」へ移行した（§4）。将来的には、文字起こし・自己回帰的な応答テキスト生成（カテゴリ選択ロジック）を組み込み、最終的には思考層 (LLM) も Zig 側に統合して単一バイナリ化する。
+40ms チャンク単位で EnCodec 推論をかけていた旧方式はチャンク境界で歪み・かすれ音が生じていたため、「発話が確定するまでは生 PCM のまま中継する」方式に変更済み（詳細は [docs/architecture.md](docs/architecture.md) §1.3, §5.1）。応答生成も、受け取った音声をそのまま読み上げるエコーバック → Bark-small によるリアルタイム合成 → ビルド時に事前生成した応答音声を即時再生する「超低遅延トークンルーター」、という順で簡略化してきたが（§4）、最終段の実行時プロセスは当初 Python (`stream_decoder.py`) だった。これを `src/player.zig` + [zaudio](https://github.com/zig-gamedev/zaudio) によるネイティブ実装に置き換え、パイプライン後半の Python プロセスを完全に廃止した。将来的には、文字起こし・自己回帰的な応答テキスト生成（カテゴリ選択ロジック）を組み込み、最終的には `stream_mic_encoder.py` 側も Zig 側に統合して単一バイナリ化する。
 
 ## ディレクトリ構成
 
@@ -51,7 +51,6 @@ python/pipeline/stream_decoder.py
 ├── python/
 │   ├── pipeline/                # 現行の実動パイプライン
 │   │   ├── stream_mic_encoder.py   # マイク入力 → 生PCM送信 (is_speechフラグ付き) → stdout
-│   │   ├── stream_decoder.py       # stdin (発話確定トリガー) → 事前ビルド済み応答を即時再生 (トークンルーター)
 │   │   └── stream_encoder.py       # (補助) stdin WAV風入力のストリームエンコード
 │   └── experiments/             # 検証用の使い捨てスクリプト群
 │       ├── encode_speech.py / generate_tokens.py / export_bark_tokens.py 等
@@ -64,6 +63,7 @@ python/pipeline/stream_decoder.py
 ├── src/
 │   ├── main.zig                 # CLI エントリポイント (`hoge`): encode/decode/stream サブコマンド
 │   ├── receiver.zig             # VAD ステートマシン。パイプ間の発話区間検出・中継担当
+│   ├── player.zig               # 応答アセットの即時再生 (zaudio)。stream_decoder.py の後継
 │   ├── model.zig                # SafeTensors (.safetensors) のパース・mmap ビュー
 │   ├── encoder.zig / decoder.zig # EnCodec 24kHz の SEANet エンコーダ/デコーダ (Zig 実装)
 │   ├── rvq.zig                   # 残差ベクトル量子化 (RVQ) のフレーム形式・エンコード/デコード
@@ -85,7 +85,9 @@ Nix + direnv を使用する（`shell.nix` が zig 0.16 / zls / python3.11 等�
 direnv allow
 ```
 
-Python 側の依存関係（`sounddevice`, `numpy` 等）は別途 venv などで用意する。実行時パイプライン (`python/pipeline/*`) は `torch`/`transformers`/Bark を一切ロードしない。`torch`, `transformers`, `encodec` が必要なのはビルド時ツール `python/experiments/build_response_assets.py`（および他の `python/experiments/*` スクリプト）のみ。
+Python 側の依存関係（`sounddevice`, `numpy` 等）は別途 venv などで用意する。これが必要なのは `stream_mic_encoder.py`（マイク入力側）のみで、応答再生側はネイティブの `./player` に置き換わったため Python 不要。`torch`, `transformers`, `encodec` が必要なのはビルド時ツール `python/experiments/build_response_assets.py`（および他の `python/experiments/*` スクリプト）のみで、実行時パイプラインには一切関係しない。
+
+`zaudio`（[zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio)、内部で miniaudio を使用）は Zig の依存関係として `build.zig.zon` に登録済みで、`zig build` が自動的にフェッチする。
 
 ### 2. EnCodec の重みを取得
 
@@ -98,8 +100,11 @@ nu scripts/download_weights.nu
 
 ```sh
 zig build-exe src/receiver.zig
-zig build          # src/main.zig (CLI "hoge") のビルド。zig-out/bin/hoge に生成
+zig build          # src/main.zig (CLI "hoge") と src/player.zig (応答再生) をビルド
+                    # -> zig-out/bin/hoge, zig-out/bin/player
 ```
+
+初回の `zig build` は `zaudio` パッケージ（と、そのさらに依存する `system_sdk`）をネットワークから取得する。macOS では `zaudio`/`miniaudio` のビルドに CoreAudio 等のフレームワークが必要。Nix 環境でこれらのフレームワーク検索パスが自動解決できない場合に備え、`build.zig` は `xcrun --show-sdk-path` の結果をフォールバックのフレームワーク検索パスとして明示的に追加している。
 
 `hoge` の主なサブコマンド（`zig build-exe`/`zig build` 後、`-h` でも確認可能）:
 
@@ -111,7 +116,7 @@ hoge --stream                  # stdin の RVQ トークンを読み、stdout �
 
 ### 4. 応答アセットの事前ビルド（初回のみ）
 
-`stream_decoder.py` は実行時に Bark を呼ばず、事前生成済みの応答音声を再生するだけなので、先に一度だけビルドしておく。
+`player` は実行時に Bark を呼ばず、事前生成済みの応答音声を再生するだけなので、先に一度だけビルドしておく。
 
 ```sh
 python3 python/experiments/build_response_assets.py
@@ -120,22 +125,23 @@ python3 python/experiments/build_response_assets.py
 
 ### 5. 応答プロトタイプ・パイプラインの実行
 
-マイクで喋った音声を Zig 製 VAD (`receiver`) が生 PCM のまま発話区間として確定し、`stream_decoder.py` がその発話確定をトリガーに、§4 で事前ビルドした固定・短文の冷淡な応答（例: "Acknowledged."）からランダムに1件選んで即座に再生する導通確認構成（ユーザーの発話内容そのものは応答に反映されない）。
+マイクで喋った音声を Zig 製 VAD (`receiver`) が生 PCM のまま発話区間として確定し、Zig 製の `player` がその発話確定をトリガーに、§4 で事前ビルドした固定・短文の冷淡な応答（例: "Acknowledged."）からランダムに1件選んで zaudio 経由で即座に再生する導通確認構成（ユーザーの発話内容そのものは応答に反映されない）。このパイプラインに Python プロセスは `stream_mic_encoder.py` の1つだけで、応答側に Python/torch は一切登場しない。
 
 ```sh
-python/pipeline/stream_mic_encoder.py | ./receiver | python/pipeline/stream_decoder.py
+python/pipeline/stream_mic_encoder.py | ./receiver | ./zig-out/bin/player
 ```
 
 ## 現在の進捗とロードマップ
 
-- **Phase 1〜5: 完了**
-  - マイク入力 → UNIX パイプ通信 → Zig 側 VAD・生 PCM バッファリング → 発話確定をトリガーにした、事前ビルド済み応答アセットの即時再生（超低遅延トークンルーター）まで成立。
+- **Phase 1〜6: 完了**
+  - マイク入力 → UNIX パイプ通信 → Zig 側 VAD・生 PCM バッファリング → 発話確定をトリガーにした、事前ビルド済み応答アセットのネイティブ即時再生（Zig + zaudio）まで成立。
 - **解消済みの課題**
   - 40ms 単位のチャンク分割による境界歪み・かすれ音: `stream_mic_encoder.py` が都度 EnCodec 推論をかけていたことが原因だったため、生 PCM バッファリング方式に移行して解消した。
-  - エコーバック（オウム返し）からの卒業: `stream_decoder.py` は受け取った PCM を復元する代わりに、発話確定をトリガーとして固定の冷淡な応答を再生するようになった。
-  - 実行時 Bark 推論（数秒かかる）の撤廃: `python/experiments/build_response_assets.py` でビルド時に一度だけ Bark-small を実行し、応答音声を `assets/responses/` にアセット化。`stream_decoder.py` は起動時にこれを全てメモリへロードしておき、発話確定時はキャッシュからランダムに1件選んで即座に再生するだけになり、`torch`/`transformers`/Bark への実行時依存が無くなった。コミットから再生開始までのレイテンシは `stream_decoder.py` が stderr に出力する。
+  - エコーバック（オウム返し）からの卒業: 受け取った PCM を復元する代わりに、発話確定をトリガーとして固定の冷淡な応答を再生するようになった。
+  - 実行時 Bark 推論（数秒かかる）の撤廃: `python/experiments/build_response_assets.py` でビルド時に一度だけ Bark-small を実行し、応答音声を `assets/responses/` にアセット化。これにより実行時に重い推論は一切発生しなくなった。
+  - パイプライン後半の Python プロセスの撤廃: `python/pipeline/stream_decoder.py` を削除し、`src/player.zig`（[zaudio](https://github.com/zig-gamedev/zaudio) 使用）に置き換えた。起動時に `assets/responses/manifest.json` の `.wav` を全てロードして zaudio の `Sound`/`AudioBuffer` として保持し、発話確定時はその場から選んで `Sound.start()` するだけになり、`torch`/`transformers`/Bark はもちろん Python インタプリタ自体への実行時依存も無くなった。コミットから再生開始までのレイテンシは `player` が stderr に出力する。
 - **次のマイルストーン**
   - 入力音声の文字起こし（ASR）と、聞いた内容に基づくカテゴリ選択（ルーティング）ロジック。現状は発話内容に関わらず固定フレーズからランダムに応答するのみ。
-  - 最終的に Python スキャフォールド (`python/pipeline/*`) を Zig 実装に置き換え、単一バイナリ化する。
+  - 残る Python プロセス `stream_mic_encoder.py`（マイク入力・EnCodec不使用）も Zig 側に統合し、最終的に単一バイナリ化する。
 
 詳細な通信プロトコル仕様・VAD ステートマシン仕様・技術的課題については [docs/architecture.md](docs/architecture.md) を参照。企画段階の思想・アルゴリズム案は [docs/memo.md](docs/memo.md) を参照（一部は現行実装と異なる設計案を含む）。
