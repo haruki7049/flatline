@@ -86,59 +86,54 @@ const is_silence = (header.reserved == 0);
    - それ以外は `sample_buffer` の先頭 `valid_frames × SAMPLES_PER_FRAME` サンプルぶん（＝末尾の無音を切り捨てた生 PCM）を 1 パケットにまとめ、0xAA55 ヘッダ（`reserved = 1`）を付けて stdout（次段のデコーダ）へ転送し、`[SPEECH COMMITTED]` をログ。
 4. いずれの場合もバッファ・カウンタをリセットして `idle` に戻る。
 
-## 4. 冷淡な思考層プロトタイプ (`stream_decoder.py`)
+## 4. 冷淡な思考層プロトタイプ: オフライン事前ビルド + 実行時トークンルーター
 
-応答生成はまだ「聞いた内容を理解して返す」段階にはなく、**発話確定を単なるトリガーとして固定・短文応答を返す**プロトタイプ。
+応答生成はまだ「聞いた内容を理解して返す」段階にはなく、**発話確定を単なるトリガーとして固定・短文応答を返す**プロトタイプ。Bark-small による自己回帰生成（数百ms〜数秒かかる）は実行時から完全に排除し、**ビルド時に一度だけ**実行して結果をアセット化する構成に分離した。
 
-### 4.1 構成
+### 4.1 オフラインビルド (`python/experiments/build_response_assets.py`)
 
-- モデル: `suno/bark-small`（`transformers.BarkModel` / `AutoProcessor`）。起動時に一度だけロードし、デバイス（CUDA/MPS/CPU）に常駐させる。
-- 最終デコード: `BarkModel.generate()` を直接呼び出す高レベル API を使う。Semantic → Coarse → Fine の 3 段階に加え、Fine 段の EnCodec 8-stage トークンから PCM への変換（内部で `self.codec_model.decode` 相当）までを 1 回の呼び出し内で完結させる。§1.3 で使っていた `encodec` パッケージの `EncodecModel` は、このプロセスではもう使用しない。
-- 応答テキスト: 以下の固定フレーズからランダムに 1 つを選択する（`RESPONSE_PHRASES`）。
+実行コマンド:
 
-  ```
-  Acknowledged.
-  Signal received. Stand by.
-  Input logged.
-  Processing complete.
-  State confirmed.
-  Noted.
-  ```
-
-### 4.2 生成ロジック（Semantic → Coarse → Fine、`bark_model.generate()` に集約）
-
-旧実装では `python/experiments/generate_speech_lm.py` を踏襲し、`model.semantic.generate` → `model.coarse_acoustics.generate` → `model.fine_acoustics.generate` を手動で個別に呼び出していた。この方式は各段の `GenerationConfig` を自前で組み立てる必要がある一方、ステージ間の EOS 検出・アテンションマスクの引き継ぎが正しく働かず、単語が終わっても最大長（`SEMANTIC_MAX_NEW_TOKENS`）まで破裂音が反復生成される不具合（意味不明な喃語/「ダンダンダン」ループ）があった。
-
-**現行実装**: `generate_flat_response_audio` は `bark_model.generate(**inputs, **GENERATE_KWARGS)` を 1 回呼ぶだけで、Semantic → Coarse → Fine の 3 段階と EnCodec デコードまでを `transformers` 側に任せる。`GENERATE_KWARGS` は各段の設定を `semantic_`/`coarse_`/`fine_` を接頭辞に持つキーワード引数として渡す、`transformers` が想定する公式な上書き方法。
-
-```python
-GENERATE_KWARGS = dict(
-    semantic_temperature=FLAT_TEMPERATURE,
-    coarse_temperature=FLAT_TEMPERATURE,
-    fine_temperature=FLAT_TEMPERATURE,
-    semantic_max_new_tokens=SEMANTIC_MAX_NEW_TOKENS,
-)
+```sh
+python3 python/experiments/build_response_assets.py
 ```
 
-- `voice_preset = "v2/en_speaker_6"` を `bark_processor` に渡して話者埋め込みを固定し、発話ごとに声質が暴れないようにする。
-- 手動で `BarkSemanticGenerationConfig` 等を組み立てる構成は廃止したため、`max_length`/`max_new_tokens` の競合や `generation_config` と重複引数を同時に渡すことに起因する `transformers` の警告は発生しない。
+- モデル: `suno/bark-small`（`transformers.BarkModel` / `AutoProcessor`）。このスクリプトの実行時にのみロードされ、`stream_decoder.py`（実行時プロセス）には一切ロードされない。
+- 固定フレーズをカテゴリ別に用意し（`ack`/`status`/`reject`/`complete`、各2文）、`bark_model.generate()` を 1 回呼ぶだけで Semantic → Coarse → Fine の 3 段階と EnCodec デコードまで完結させる。
 
-> **temperature=0.2 は危険域**: 当初 `FLAT_TEMPERATURE = 0.2` としていたが、極端に低い temperature は Bark の自己回帰的な coarse/fine acoustics 生成でモード崩壊（同一の音響トークンが毎ステップ反復選択される）を引き起こし、デコード結果が人の声ではなく単一周波数の発振音（ハウリング/ピー音）になる不具合があった。`0.7` に引き上げることでサンプリングの多様性を確保し、この崩壊を回避している。
+  ```python
+  bark_model.generate(
+      **inputs,
+      semantic_temperature=0.7,
+      coarse_temperature=0.7,
+      fine_temperature=0.7,
+      semantic_max_new_tokens=96,
+      min_eos_p=0.05,
+  )
+  ```
 
-**生成長の上限**: Bark-small の Semantic 段はデフォルトで `max_new_tokens=768`（Semantic レート ~49Hz 換算で 10 秒超）まで生成し得るが、固定応答フレーズは 1〜5 単語の短文しかない。`SEMANTIC_MAX_NEW_TOKENS = 96` でこれを明示的に絞り込み、Semantic 系列長を基準に決まる Coarse/Fine の生成長も連動して短縮する。
+  - `voice_preset = "v2/en_speaker_6"` で話者を固定。
+  - `temperature = 0.7`: 当初 `0.2` だったが、極端に低い temperature は coarse/fine acoustics でモード崩壊（同一トークンの反復選択）を起こし、人の声ではなく単一周波数の発振音（ハウリング/ピー音）になる不具合があったため引き上げた。
+  - `semantic_max_new_tokens = 96`: Semantic 段のデフォルト `max_new_tokens=768`（10秒超）は短文には過大なため制限。`min_eos_p = 0.05` で EOS を早めに出しやすくし、短文に対して余分な喃語が続かないようにする。
+  - トークン抽出は `bark_model.codec_decode` を一時的にフックし、`generate()` が最後に PCM へデコードする直前の EnCodec fine トークン `[1, 8, T]` をそのまま捕捉する（`export_bark_tokens.py` と同じ手法）。手動で `model.semantic.generate` 等を個別に呼ぶ旧方式は、ステージ間の EOS 検出・アテンションマスクの引き継ぎが正しく働かず、単語が終わっても最大長まで破裂音が反復生成される不具合（意味不明な喃語/「ダンダンダン」ループ）があったため廃止した。
+- 無音トリムは EnCodec フレーム単位（320 サンプル = 1 フレーム, 75Hz）で行い、トリム後のトークン列を再デコードしたものを `.wav` として保存する（`.bin` を後で単体デコードしたときの音と一致させるため）。
+- 出力: `assets/responses/<category>_<id>.bin`（EnCodec RVQ トークン `[T, 8] uint16`、`src/rvq.zig` の `Frame`/`framesFromBytes` と同一レイアウト）、`<category>_<id>.wav`（24kHz mono, 検証用）、`manifest.json`（カテゴリ・テキスト・フレーム数・ファイルパスの対応表）。
 
-**末尾無音のトリム**: `bark_model.generate()` が返す PCM に対し、`trim_trailing_silence`（20ms フレーム単位の RMS がしきい値 `0.01` を下回る末尾を切り捨てる簡易処理）を適用してから再生する。
+### 4.2 実行時トークンルーター (`stream_decoder.py`)
 
-### 4.3 処理フロー
+`stream_decoder.py` は起動時に `torch`/`transformers`/Bark を一切ロードしない。代わりに:
 
-1. `receiver` から「発話確定」パケットを受信する（ペイロードは読み捨てる）。
-2. `RESPONSE_PHRASES` からランダムに 1 文を選び、上記の 3 段階生成で EnCodec トークンを得る。
-3. `codec.decode` で PCM に変換し、再生開始時に `[flatline-decoder] Playing response (...)...` を stderr に出力したうえで `sounddevice` で再生する。
+1. 起動時に `assets/responses/manifest.json` を読み込み、そこに列挙された `.wav` を全てメモリへロードしてキャッシュする（`RESPONSE_ASSETS`）。manifest が存在しない場合は `build_response_assets.py` を先に実行するよう案内してエラー終了する。
+2. `receiver` から「発話確定」パケットを受信したら、ペイロード（ユーザーの発話内容）は読み捨て、`time.perf_counter()` でコミット時刻を記録する。
+3. `RESPONSE_ASSETS` からランダムに 1 件（`pick_response()`。カテゴリを指定すればそのカテゴリ内からランダム選択も可能）を選び、キャッシュ済みの波形をそのまま `sounddevice.play()` に渡す。
+4. コミットから再生開始までのレイテンシをミリ秒単位で計測し、`[flatline-decoder] ... Commit-to-playback latency: ...ms` として stderr に出力する。
 
-### 4.4 既知の制約
+実行時に重い推論が一切発生しないため、起動後の応答レイテンシはディスクI/O・配列コピー・`sounddevice`呼び出しのオーバーヘッドのみ（数十ミリ秒オーダー）に抑えられる。
+
+### 4.3 既知の制約
 
 - 入力音声の文字起こしも、聞いた内容に基づくテキスト生成も行っていない。応答は発話内容に関わらず固定候補からのランダム選択であり、「オウム返し」から「固定文の読み上げ」になっただけで、対話としての思考層はまだ存在しない（§5.2 のロードマップ）。
-- Bark-small の 3 段階生成（Semantic → Coarse → Fine）は数百 ms〜数秒オーダーの推論コストがあり、発話確定から応答再生開始までの遅延（レイテンシ）は旧来のエコーバックより大きい（`SEMANTIC_MAX_NEW_TOKENS` の調整で短縮済みだが、ゼロにはならない）。
+- 応答の多様性はビルド時にあらかじめ用意したフレーズ数（現状カテゴリごとに2文、計8文）に限られる。新しい応答を増やすには `build_response_assets.py` の `RESPONSES` を編集し、再ビルドする必要がある。
 
 ## 5. 現在の技術的課題と次のアプローチ
 
@@ -150,8 +145,8 @@ GENERATE_KWARGS = dict(
 
 ### 5.2 思考層 (LLM) の未結合（部分的に着手）
 
-§4 で「発話確定 → 固定フレーズ群からのランダム選択 → Bark-small による音声合成」という応答生成プロトタイプを導入したが、これは疎通確認目的の仮実装であり、まだ対話としての思考層ではない。入力音声の文字起こし（ASR）も、聞いた内容に基づくテキスト生成（自己回帰モデルによる応答テキスト生成）も行っていない。`docs/memo.md` に記載の「無感情化（Monotone Control）」や 1B〜2B クラスの軽量 LLM 統合は未着手のフェーズ 3 相当であり、次のマイルストーンとして残っている。
+§4 で「発話確定 → 事前ビルド済み固定フレーズ群からのランダム選択 → プリビルド済み音声の即時再生」という応答生成プロトタイプを導入したが、これは疎通確認・低遅延化目的の仮実装であり、まだ対話としての思考層ではない。入力音声の文字起こし（ASR）も、聞いた内容に基づくテキスト生成（自己回帰モデルによる応答テキスト生成）も行っていない。`docs/memo.md` に記載の「無感情化（Monotone Control）」や 1B〜2B クラスの軽量 LLM 統合は未着手のフェーズ 3 相当であり、次のマイルストーンとして残っている（将来的には、ASR結果からカテゴリ `ack`/`status`/`reject`/`complete` 等をルーティングする、あるいはLLMが直接カテゴリを選ぶ形が想定される）。
 
 ### 5.3 Python スキャフォールドの段階的排除
 
-EnCodec のエンコード/デコード処理自体は `src/encoder.zig` / `src/decoder.zig` / `src/rvq.zig` に Zig 実装済みで、`hoge --encode` / `hoge --stream` から呼び出せる状態にある。一方、現行の実運用パイプライン (`python/pipeline/stream_mic_encoder.py`, `stream_decoder.py`) はマイク入出力 (`sounddevice`) 周りとストリーミング制御のために依然として Python に依存している。最終的にはこれらの入出力制御も Zig 側 (`src/main.zig` 系) に統合し、単一バイナリ化することを目指す。
+EnCodec のエンコード/デコード処理自体は `src/encoder.zig` / `src/decoder.zig` / `src/rvq.zig` に Zig 実装済みで、`hoge --encode` / `hoge --stream` から呼び出せる状態にある。実行時パイプライン (`python/pipeline/stream_mic_encoder.py`, `stream_decoder.py`) は、§4.2 の変更によって `torch`/`transformers` への依存を失い、マイク入出力・応答波形の再生 (`sounddevice`) とストリーミング制御のみを担うようになった。重い推論 (`suno/bark-small`) は `python/experiments/build_response_assets.py` というビルド時ツールに切り出されており、実行時プロセスの Python 依存はこれまでより軽量になっている。最終的にはこれらの入出力制御も Zig 側 (`src/main.zig` 系) に統合し、単一バイナリ化することを目指す。

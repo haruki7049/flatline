@@ -1,91 +1,74 @@
+import json
 import random
 import struct
 import sys
+import time
+import wave
+from pathlib import Path
+
 import numpy as np
 import sounddevice as sd
-import torch
-from transformers import AutoProcessor, BarkModel
-
-# Select optimal acceleration device
-if torch.cuda.is_available():
-    device = "cuda:0"
-elif torch.backends.mps.is_available():
-    device = "mps"
-else:
-    device = "cpu"
 
 SAMPLE_RATE = 24000
 MAGIC_NUMBER = 0xAA55
 HEADER_FMT = "<HBBI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
-# 0.2 was too low: it pushed Bark's autoregressive coarse/fine stages into mode
-# collapse (babbling / a repeated plosive loop instead of words). 0.7 keeps the
-# tone calm and monotone without the sampling degenerating like that.
-FLAT_TEMPERATURE = 0.7
-
-# Pins the speaker identity so it doesn't drift between utterances (no voice_preset
-# samples a new, unpredictable voice/timbre on every call).
-VOICE_PRESET = "v2/en_speaker_6"
-
-# The fixed response phrases are all 1-5 words. Left uncapped, Bark's semantic stage
-# can run out to ~10s+ of audio regardless of how short the text is.
-SEMANTIC_MAX_NEW_TOKENS = 96
-
-# Cold, affectless acknowledgements. One is picked at random per committed utterance.
-RESPONSE_PHRASES = [
-    "Acknowledged.",
-    "Signal received. Stand by.",
-    "Input logged.",
-    "Processing complete.",
-    "State confirmed.",
-    "Noted.",
-]
-
-sys.stderr.write("[flatline-decoder] Loading suno/bark-small...\n")
-BARK_MODEL_ID = "suno/bark-small"
-bark_processor = AutoProcessor.from_pretrained(BARK_MODEL_ID)
-bark_model = BarkModel.from_pretrained(BARK_MODEL_ID, torch_dtype=torch.float32).to(device)
-bark_model.eval()
-
-# Calling bark_model.generate() directly (rather than driving
-# semantic/coarse_acoustics/fine_acoustics.generate() separately) lets transformers
-# carry EOS detection and attention masks between the three stages correctly, and
-# avoids hand-built GenerationConfig objects that triggered deprecation warnings.
-# The semantic_*/coarse_*/fine_* prefixed kwargs below are the documented way to
-# override each stage's generation settings through this single entry point.
-GENERATE_KWARGS = dict(
-    semantic_temperature=FLAT_TEMPERATURE,
-    coarse_temperature=FLAT_TEMPERATURE,
-    fine_temperature=FLAT_TEMPERATURE,
-    semantic_max_new_tokens=SEMANTIC_MAX_NEW_TOKENS,
-)
-
-sys.stderr.write(f"[flatline-decoder] Ready on [{device}]. Listening for committed utterances...\n")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ASSETS_DIR = REPO_ROOT / "assets" / "responses"
+MANIFEST_PATH = ASSETS_DIR / "manifest.json"
 
 
-def generate_flat_response_audio(text: str) -> np.ndarray:
-    """Text -> flat/monotone PCM audio via Bark-small (EnCodec decode happens inside generate())."""
-    inputs = bark_processor(text, voice_preset=VOICE_PRESET, return_tensors="pt").to(device)
-
-    with torch.no_grad():
-        audio_array = bark_model.generate(**inputs, **GENERATE_KWARGS)
-
-    return audio_array.cpu().numpy().squeeze()
+def load_wav_mono_f32(path: Path) -> np.ndarray:
+    with wave.open(str(path), "rb") as f:
+        if f.getsampwidth() != 2 or f.getnchannels() != 1:
+            raise ValueError(f"{path}: expected mono 16-bit PCM")
+        pcm = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+    return pcm.astype(np.float32) / 32768.0
 
 
-TRIM_RMS_THRESHOLD = 0.01
-TRIM_FRAME_SAMPLES = int(SAMPLE_RATE * 0.02)  # 20ms
+def load_response_assets() -> list[dict]:
+    """Loads every response WAV from manifest.json into memory up front.
+
+    No Bark/EnCodec inference happens at runtime any more: this is a pure
+    token-router that just picks a pre-baked waveform and plays it.
+    """
+    if not MANIFEST_PATH.exists():
+        sys.stderr.write(
+            f"[flatline-decoder] {MANIFEST_PATH} not found. Run "
+            "python/experiments/build_response_assets.py first.\n"
+        )
+        sys.exit(1)
+
+    with open(MANIFEST_PATH) as f:
+        manifest = json.load(f)
+
+    if manifest.get("sample_rate", SAMPLE_RATE) != SAMPLE_RATE:
+        raise ValueError(
+            f"manifest sample_rate {manifest.get('sample_rate')} != expected {SAMPLE_RATE}"
+        )
+
+    assets = []
+    for entry in manifest["responses"]:
+        audio = load_wav_mono_f32(ASSETS_DIR / entry["wav"])
+        assets.append({**entry, "audio": audio})
+    return assets
 
 
-def trim_trailing_silence(audio: np.ndarray) -> np.ndarray:
-    """Drops trailing low-RMS frames so a capped-but-still-silent tail isn't played."""
-    for end in range(len(audio), 0, -TRIM_FRAME_SAMPLES):
-        start = max(0, end - TRIM_FRAME_SAMPLES)
-        frame = audio[start:end]
-        if frame.size and np.sqrt(np.mean(frame**2)) > TRIM_RMS_THRESHOLD:
-            return audio[:end]
-    return audio
+sys.stderr.write(f"[flatline-decoder] Loading response assets from {ASSETS_DIR}...\n")
+RESPONSE_ASSETS = load_response_assets()
+sys.stderr.write(f"[flatline-decoder] Loaded {len(RESPONSE_ASSETS)} response assets.\n")
+
+sys.stderr.write("[flatline-decoder] Ready. Listening for committed utterances...\n")
+
+
+def pick_response(category: str | None = None) -> dict:
+    candidates = RESPONSE_ASSETS
+    if category is not None:
+        candidates = [a for a in RESPONSE_ASSETS if a["category"] == category]
+        if not candidates:
+            raise ValueError(f"no response assets in category {category!r}")
+    return random.choice(candidates)
 
 
 def read_exact(n):
@@ -117,15 +100,20 @@ try:
         if payload is None:
             break
 
-        text = random.choice(RESPONSE_PHRASES)
-        sys.stderr.write(f'[flatline-decoder] Utterance committed. Responding: "{text}"\n')
+        commit_time = time.perf_counter()
 
-        audio_out = trim_trailing_silence(generate_flat_response_audio(text))
-
+        response = pick_response()
         sys.stderr.write(
-            f"[flatline-decoder] Playing response ({len(audio_out) / SAMPLE_RATE:.2f}s)...\n"
+            f'[flatline-decoder] Utterance committed. Routing to "{response["text"]}" '
+            f'({response["category"]}:{response["id"]})\n'
         )
-        sd.play(audio_out, samplerate=SAMPLE_RATE)
+
+        sd.play(response["audio"], samplerate=SAMPLE_RATE)
+        latency_ms = (time.perf_counter() - commit_time) * 1000.0
+        sys.stderr.write(
+            f"[flatline-decoder] Playing response ({response['duration_s']:.2f}s). "
+            f"Commit-to-playback latency: {latency_ms:.1f}ms\n"
+        )
         sd.wait()
 
 except KeyboardInterrupt:

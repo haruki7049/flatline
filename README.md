@@ -29,14 +29,15 @@ python/pipeline/stream_mic_encoder.py
      │ stdout → stdin (パイプ)
      ▼
 python/pipeline/stream_decoder.py
-  - 受け取った生 PCM の中身は使わず、「発話確定」を応答生成のトリガー
-    としてのみ扱う（エコーバックは廃止）
-  - suno/bark-small (`bark_model.generate()`) を temperature 0.7 で駆動し、
-    話者を固定(voice_preset)した上で定型の冷淡な短文から PCM を直接生成
-  - sounddevice でスピーカーへ再生
+  - 受け取った生 PCM の中身は使わず、「発話確定」を応答トリガーとしてのみ
+    扱う（エコーバックは廃止）。torch/transformers/Bark はロードしない
+  - 起動時に assets/responses/manifest.json 記載の .wav を全てメモリに
+    キャッシュしておき、確定時にランダムに1件選んで即座に再生するだけ
+  - sounddevice でスピーカーへ再生。コミットから再生開始までのレイテンシを
+    time.perf_counter() で計測して stderr にログ出力
 ```
 
-40ms チャンク単位で EnCodec 推論をかけていた旧方式はチャンク境界で歪み・かすれ音が生じていたため、「発話が確定するまでは生 PCM のまま中継する」方式に変更済み（詳細は [docs/architecture.md](docs/architecture.md) §1.3, §5.1）。さらに `stream_decoder.py` は、受け取った音声をそのまま読み上げるエコーバックから、発話確定をトリガーに固定・短文の冷淡な応答を Bark-small で合成するプロトタイプへ置き換えた（§4）。将来的には、文字起こし・自己回帰的な応答テキスト生成を組み込み、最終的には思考層 (LLM) も Zig 側に統合して単一バイナリ化する。
+40ms チャンク単位で EnCodec 推論をかけていた旧方式はチャンク境界で歪み・かすれ音が生じていたため、「発話が確定するまでは生 PCM のまま中継する」方式に変更済み（詳細は [docs/architecture.md](docs/architecture.md) §1.3, §5.1）。`stream_decoder.py` は、受け取った音声をそのまま読み上げるエコーバックから、発話確定をトリガーに固定・短文の冷淡な応答を再生するプロトタイプへ置き換えた上で、さらに実行時の Bark 推論自体を撤廃し、`python/experiments/build_response_assets.py` でビルド時に事前生成した応答音声を即時再生する「超低遅延トークンルーター」へ移行した（§4）。将来的には、文字起こし・自己回帰的な応答テキスト生成（カテゴリ選択ロジック）を組み込み、最終的には思考層 (LLM) も Zig 側に統合して単一バイナリ化する。
 
 ## ディレクトリ構成
 
@@ -50,7 +51,7 @@ python/pipeline/stream_decoder.py
 ├── python/
 │   ├── pipeline/                # 現行の実動パイプライン
 │   │   ├── stream_mic_encoder.py   # マイク入力 → 生PCM送信 (is_speechフラグ付き) → stdout
-│   │   ├── stream_decoder.py       # stdin (発話確定トリガー) → Bark-small応答合成 → スピーカー再生
+│   │   ├── stream_decoder.py       # stdin (発話確定トリガー) → 事前ビルド済み応答を即時再生 (トークンルーター)
 │   │   └── stream_encoder.py       # (補助) stdin WAV風入力のストリームエンコード
 │   └── experiments/             # 検証用の使い捨てスクリプト群
 │       ├── encode_speech.py / generate_tokens.py / export_bark_tokens.py 等
@@ -84,7 +85,7 @@ Nix + direnv を使用する（`shell.nix` が zig 0.16 / zls / python3.11 等�
 direnv allow
 ```
 
-Python 側の依存関係（`torch`, `sounddevice`, `transformers` 等）は別途 venv などで用意する。`stream_decoder.py` は初回実行時に Hugging Face Hub から `suno/bark-small` をダウンロードする（`encodec` パッケージはこのパイプラインではもう使用しないが、`python/experiments/*` の一部スクリプトは依然依存する）。
+Python 側の依存関係（`sounddevice`, `numpy` 等）は別途 venv などで用意する。実行時パイプライン (`python/pipeline/*`) は `torch`/`transformers`/Bark を一切ロードしない。`torch`, `transformers`, `encodec` が必要なのはビルド時ツール `python/experiments/build_response_assets.py`（および他の `python/experiments/*` スクリプト）のみ。
 
 ### 2. EnCodec の重みを取得
 
@@ -108,9 +109,18 @@ hoge --encode input.wav        # input.wav (24kHz) を tokens.bin にエンコ�
 hoge --stream                  # stdin の RVQ トークンを読み、stdout に raw f32 PCM を書く
 ```
 
-### 4. 応答プロトタイプ・パイプラインの実行
+### 4. 応答アセットの事前ビルド（初回のみ）
 
-マイクで喋った音声を Zig 製 VAD (`receiver`) が生 PCM のまま発話区間として確定し、`stream_decoder.py` がその発話確定をトリガーに、固定・短文の冷淡な応答（例: "Acknowledged."）を Bark-small で合成して読み上げる導通確認構成（ユーザーの発話内容そのものは応答に反映されない）。
+`stream_decoder.py` は実行時に Bark を呼ばず、事前生成済みの応答音声を再生するだけなので、先に一度だけビルドしておく。
+
+```sh
+python3 python/experiments/build_response_assets.py
+# -> assets/responses/{ack,status,reject,complete}_{0,1}.{bin,wav} と manifest.json を生成
+```
+
+### 5. 応答プロトタイプ・パイプラインの実行
+
+マイクで喋った音声を Zig 製 VAD (`receiver`) が生 PCM のまま発話区間として確定し、`stream_decoder.py` がその発話確定をトリガーに、§4 で事前ビルドした固定・短文の冷淡な応答（例: "Acknowledged."）からランダムに1件選んで即座に再生する導通確認構成（ユーザーの発話内容そのものは応答に反映されない）。
 
 ```sh
 python/pipeline/stream_mic_encoder.py | ./receiver | python/pipeline/stream_decoder.py
@@ -118,13 +128,12 @@ python/pipeline/stream_mic_encoder.py | ./receiver | python/pipeline/stream_deco
 
 ## 現在の進捗とロードマップ
 
-- **Phase 1〜4: 完了**
-  - マイク入力 → UNIX パイプ通信 → Zig 側 VAD・生 PCM バッファリング → 発話確定をトリガーにした Bark-small による固定・短文応答の合成・再生まで成立。
+- **Phase 1〜5: 完了**
+  - マイク入力 → UNIX パイプ通信 → Zig 側 VAD・生 PCM バッファリング → 発話確定をトリガーにした、事前ビルド済み応答アセットの即時再生（超低遅延トークンルーター）まで成立。
 - **解消済みの課題**
   - 40ms 単位のチャンク分割による境界歪み・かすれ音: `stream_mic_encoder.py` が都度 EnCodec 推論をかけていたことが原因だったため、生 PCM バッファリング方式に移行して解消した。
-  - エコーバック（オウム返し）からの卒業: `stream_decoder.py` は受け取った PCM を復元する代わりに、発話確定をトリガーとして Bark-small (temperature 0.2) で生成した定型の冷淡な応答を再生するようになった。トレードオフとして、Bark-small の 3 段階生成（Semantic → Coarse → Fine）のぶん応答再生開始までの遅延が増えた。
-- **進行中**
-  - 実行時の Bark 自己回帰生成（数秒かかる）を廃止し、「埋め込み駆動型トークンルーター」（カテゴリ別の定型応答から即時選択・再生）へ移行するための準備として、`python/experiments/build_response_assets.py` で応答音声の EnCodec トークンを事前ビルドする仕組みを追加した（`assets/responses/`）。`stream_decoder.py` 側をこのプリビルド済みトークンの再生に切り替える作業はまだ未着手。
+  - エコーバック（オウム返し）からの卒業: `stream_decoder.py` は受け取った PCM を復元する代わりに、発話確定をトリガーとして固定の冷淡な応答を再生するようになった。
+  - 実行時 Bark 推論（数秒かかる）の撤廃: `python/experiments/build_response_assets.py` でビルド時に一度だけ Bark-small を実行し、応答音声を `assets/responses/` にアセット化。`stream_decoder.py` は起動時にこれを全てメモリへロードしておき、発話確定時はキャッシュからランダムに1件選んで即座に再生するだけになり、`torch`/`transformers`/Bark への実行時依存が無くなった。コミットから再生開始までのレイテンシは `stream_decoder.py` が stderr に出力する。
 - **次のマイルストーン**
   - 入力音声の文字起こし（ASR）と、聞いた内容に基づくカテゴリ選択（ルーティング）ロジック。現状は発話内容に関わらず固定フレーズからランダムに応答するのみ。
   - 最終的に Python スキャフォールド (`python/pipeline/*`) を Zig 実装に置き換え、単一バイナリ化する。
