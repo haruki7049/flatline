@@ -31,8 +31,8 @@ python/pipeline/stream_mic_encoder.py
 python/pipeline/stream_decoder.py
   - 受け取った生 PCM の中身は使わず、「発話確定」を応答生成のトリガー
     としてのみ扱う（エコーバックは廃止）
-  - suno/bark-small を低 temperature (0.2) で駆動し、定型の冷淡な短文
-    から EnCodec トークンを生成、EnCodec でデコードして PCM に復元
+  - suno/bark-small (`bark_model.generate()`) を temperature 0.7 で駆動し、
+    話者を固定(voice_preset)した上で定型の冷淡な短文から PCM を直接生成
   - sounddevice でスピーカーへ再生
 ```
 
@@ -78,7 +78,7 @@ Nix + direnv を使用する（`shell.nix` が zig 0.16 / zls / python3.11 等�
 direnv allow
 ```
 
-Python 側の依存関係（`torch`, `sounddevice`, `encodec`, `transformers` 等）は別途 venv などで用意する。`stream_decoder.py` は初回実行時に Hugging Face Hub から `suno/bark-small` をダウンロードする。
+Python 側の依存関係（`torch`, `sounddevice`, `transformers` 等）は別途 venv などで用意する。`stream_decoder.py` は初回実行時に Hugging Face Hub から `suno/bark-small` をダウンロードする（`encodec` パッケージはこのパイプラインではもう使用しないが、`python/experiments/*` の一部スクリプトは依然依存する）。
 
 ### 2. EnCodec の重みを取得
 

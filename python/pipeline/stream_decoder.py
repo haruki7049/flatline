@@ -4,13 +4,7 @@ import sys
 import numpy as np
 import sounddevice as sd
 import torch
-from encodec import EncodecModel
 from transformers import AutoProcessor, BarkModel
-from transformers.models.bark.generation_configuration_bark import (
-    BarkSemanticGenerationConfig,
-    BarkCoarseGenerationConfig,
-    BarkFineGenerationConfig,
-)
 
 # Select optimal acceleration device
 if torch.cuda.is_available():
@@ -24,21 +18,18 @@ SAMPLE_RATE = 24000
 MAGIC_NUMBER = 0xAA55
 HEADER_FMT = "<HBBI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-# 0.2 was too low: Bark's autoregressive coarse/fine stages fell into mode
-# collapse (the same acoustic token repeated every step), which decodes as a
-# single-frequency squeal/feedback whine instead of speech. 0.7 keeps the
-# output calm and monotone without the sampling degenerating like that.
+
+# 0.2 was too low: it pushed Bark's autoregressive coarse/fine stages into mode
+# collapse (babbling / a repeated plosive loop instead of words). 0.7 keeps the
+# tone calm and monotone without the sampling degenerating like that.
 FLAT_TEMPERATURE = 0.7
 
-# Pins the speaker identity so it doesn't drift between utterances (voice_preset=None
+# Pins the speaker identity so it doesn't drift between utterances (no voice_preset
 # samples a new, unpredictable voice/timbre on every call).
 VOICE_PRESET = "v2/en_speaker_6"
 
-# The fixed response phrases are all 1-5 words. Bark's semantic stage defaults to
-# max_new_tokens=768 (~10s+ of audio at its ~49Hz semantic rate), which is wildly
-# oversized here and is what drove generation out to ~14s regardless of the text.
-# Coarse/fine token counts are derived from the semantic sequence length, so capping
-# this one value is enough to shorten the whole three-stage pipeline.
+# The fixed response phrases are all 1-5 words. Left uncapped, Bark's semantic stage
+# can run out to ~10s+ of audio regardless of how short the text is.
 SEMANTIC_MAX_NEW_TOKENS = 96
 
 # Cold, affectless acknowledgements. One is picked at random per committed utterance.
@@ -51,81 +42,36 @@ RESPONSE_PHRASES = [
     "Noted.",
 ]
 
-sys.stderr.write(f"[flatline-decoder] Loading EnCodec 24kHz on [{device}]...\n")
-codec = EncodecModel.encodec_model_24khz()
-codec.set_target_bandwidth(6.0)
-codec.to(device)
-codec.eval()
-
 sys.stderr.write("[flatline-decoder] Loading suno/bark-small...\n")
 BARK_MODEL_ID = "suno/bark-small"
 bark_processor = AutoProcessor.from_pretrained(BARK_MODEL_ID)
 bark_model = BarkModel.from_pretrained(BARK_MODEL_ID, torch_dtype=torch.float32).to(device)
 bark_model.eval()
 
-# Generation configs are built once at startup (not per-utterance) to keep the
-# per-request path allocation-free: only inputs/KV-caches change at generate time.
-#
-# `max_length` is dropped from every dict below: it is a leftover default from the
-# base GenerationConfig and conflicts with `max_new_tokens`, which is what actually
-# bounds generation here. Setting both triggers transformers' "Both 'max_new_tokens'
-# and 'max_length' seem to have been set" warning on every call.
-_sem_dict = dict(bark_model.generation_config.semantic_config)
-_sem_dict.pop("max_length", None)
-_sem_dict["max_new_tokens"] = SEMANTIC_MAX_NEW_TOKENS
-_sem_dict["temperature"] = FLAT_TEMPERATURE
-_sem_dict["do_sample"] = True
-SEMANTIC_GEN_CONFIG = BarkSemanticGenerationConfig(**_sem_dict)
-
-_coarse_dict = dict(bark_model.generation_config.coarse_acoustics_config)
-_coarse_dict.pop("max_length", None)
-_coarse_dict["temperature"] = FLAT_TEMPERATURE
-_coarse_dict["do_sample"] = True
-COARSE_GEN_CONFIG = BarkCoarseGenerationConfig(**_coarse_dict)
-
-_fine_dict = dict(bark_model.generation_config.fine_acoustics_config)
-_fine_dict.pop("max_length", None)
-_fine_dict["temperature"] = FLAT_TEMPERATURE
-FINE_GEN_CONFIG = BarkFineGenerationConfig(**_fine_dict)
-
-CODEBOOK_SIZE = bark_model.generation_config.codebook_size
+# Calling bark_model.generate() directly (rather than driving
+# semantic/coarse_acoustics/fine_acoustics.generate() separately) lets transformers
+# carry EOS detection and attention masks between the three stages correctly, and
+# avoids hand-built GenerationConfig objects that triggered deprecation warnings.
+# The semantic_*/coarse_*/fine_* prefixed kwargs below are the documented way to
+# override each stage's generation settings through this single entry point.
+GENERATE_KWARGS = dict(
+    semantic_temperature=FLAT_TEMPERATURE,
+    coarse_temperature=FLAT_TEMPERATURE,
+    fine_temperature=FLAT_TEMPERATURE,
+    semantic_max_new_tokens=SEMANTIC_MAX_NEW_TOKENS,
+)
 
 sys.stderr.write(f"[flatline-decoder] Ready on [{device}]. Listening for committed utterances...\n")
 
 
-def generate_flat_response_tokens(text: str) -> torch.Tensor:
-    """Text -> flat/monotone EnCodec RVQ tokens via Bark-small (Semantic -> Coarse -> Fine).
-
-    Returns a tensor shaped [1, 8, T], matching EncodecModel.decode's expected layout.
-    """
+def generate_flat_response_audio(text: str) -> np.ndarray:
+    """Text -> flat/monotone PCM audio via Bark-small (EnCodec decode happens inside generate())."""
     inputs = bark_processor(text, voice_preset=VOICE_PRESET, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        semantic_output = bark_model.semantic.generate(
-            inputs["input_ids"],
-            semantic_generation_config=SEMANTIC_GEN_CONFIG,
-        )
+        audio_array = bark_model.generate(**inputs, **GENERATE_KWARGS)
 
-        coarse_output = bark_model.coarse_acoustics.generate(
-            semantic_output,
-            semantic_generation_config=SEMANTIC_GEN_CONFIG,
-            coarse_generation_config=COARSE_GEN_CONFIG,
-            codebook_size=CODEBOOK_SIZE,
-        )
-
-        # temperature lives in FINE_GEN_CONFIG; passing it again here as a kwarg
-        # alongside fine_generation_config is what triggered transformers'
-        # "Passing `generation_config` together with generation-related arguments
-        # ... is deprecated" warning.
-        fine_output = bark_model.fine_acoustics.generate(
-            coarse_output,
-            semantic_generation_config=SEMANTIC_GEN_CONFIG,
-            coarse_generation_config=COARSE_GEN_CONFIG,
-            fine_generation_config=FINE_GEN_CONFIG,
-            codebook_size=CODEBOOK_SIZE,
-        )
-
-    return fine_output
+    return audio_array.cpu().numpy().squeeze()
 
 
 TRIM_RMS_THRESHOLD = 0.01
@@ -174,11 +120,7 @@ try:
         text = random.choice(RESPONSE_PHRASES)
         sys.stderr.write(f'[flatline-decoder] Utterance committed. Responding: "{text}"\n')
 
-        tokens = generate_flat_response_tokens(text)
-
-        with torch.no_grad():
-            wav = codec.decode([(tokens, None)])
-            audio_out = trim_trailing_silence(wav.squeeze().cpu().numpy())
+        audio_out = trim_trailing_silence(generate_flat_response_audio(text))
 
         sys.stderr.write(
             f"[flatline-decoder] Playing response ({len(audio_out) / SAMPLE_RATE:.2f}s)...\n"

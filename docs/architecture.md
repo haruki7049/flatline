@@ -93,7 +93,7 @@ const is_silence = (header.reserved == 0);
 ### 4.1 構成
 
 - モデル: `suno/bark-small`（`transformers.BarkModel` / `AutoProcessor`）。起動時に一度だけロードし、デバイス（CUDA/MPS/CPU）に常駐させる。
-- 最終デコード: Bark が出力する EnCodec 8-stage トークン (`fine_output`, shape `[1, 8, T]`) を、`encodec` パッケージの `EncodecModel.encodec_model_24khz()`（§1.3 と同一モデル）で PCM に変換する。
+- 最終デコード: `BarkModel.generate()` を直接呼び出す高レベル API を使う。Semantic → Coarse → Fine の 3 段階に加え、Fine 段の EnCodec 8-stage トークンから PCM への変換（内部で `self.codec_model.decode` 相当）までを 1 回の呼び出し内で完結させる。§1.3 で使っていた `encodec` パッケージの `EncodecModel` は、このプロセスではもう使用しない。
 - 応答テキスト: 以下の固定フレーズからランダムに 1 つを選択する（`RESPONSE_PHRASES`）。
 
   ```
@@ -105,21 +105,29 @@ const is_silence = (header.reserved == 0);
   Noted.
   ```
 
-### 4.2 生成ロジック（Semantic → Coarse → Fine）
+### 4.2 生成ロジック（Semantic → Coarse → Fine、`bark_model.generate()` に集約）
 
-`python/experiments/generate_speech_lm.py` で確立した手順をそのまま関数化している（`generate_flat_response_tokens`）。
+旧実装では `python/experiments/generate_speech_lm.py` を踏襲し、`model.semantic.generate` → `model.coarse_acoustics.generate` → `model.fine_acoustics.generate` を手動で個別に呼び出していた。この方式は各段の `GenerationConfig` を自前で組み立てる必要がある一方、ステージ間の EOS 検出・アテンションマスクの引き継ぎが正しく働かず、単語が終わっても最大長（`SEMANTIC_MAX_NEW_TOKENS`）まで破裂音が反復生成される不具合（意味不明な喃語/「ダンダンダン」ループ）があった。
 
-1. **Semantic**: `bark_model.semantic.generate` でテキスト → semantic トークン。
-2. **Coarse**: `bark_model.coarse_acoustics.generate` で semantic → coarse acoustic トークン。
-3. **Fine**: `bark_model.fine_acoustics.generate` で coarse → fine acoustic トークン（= EnCodec 8-stage トークン）。
+**現行実装**: `generate_flat_response_audio` は `bark_model.generate(**inputs, **GENERATE_KWARGS)` を 1 回呼ぶだけで、Semantic → Coarse → Fine の 3 段階と EnCodec デコードまでを `transformers` 側に任せる。`GENERATE_KWARGS` は各段の設定を `semantic_`/`coarse_`/`fine_` を接頭辞に持つキーワード引数として渡す、`transformers` が想定する公式な上書き方法。
 
-各段とも `temperature = 0.7`（Semantic/Coarse は `do_sample = True`）とし、感情的な抑揚・ばらつきの少ない平坦な出力に寄せる。`voice_preset` は `"v2/en_speaker_6"` に固定し、発話ごとに声質（話者）が暴れないようにする。各段の `GenerationConfig`（`SEMANTIC_GEN_CONFIG` / `COARSE_GEN_CONFIG` / `FINE_GEN_CONFIG`）はモジュールロード時に 1 回だけ構築し、発話のたびに作り直さない。
+```python
+GENERATE_KWARGS = dict(
+    semantic_temperature=FLAT_TEMPERATURE,
+    coarse_temperature=FLAT_TEMPERATURE,
+    fine_temperature=FLAT_TEMPERATURE,
+    semantic_max_new_tokens=SEMANTIC_MAX_NEW_TOKENS,
+)
+```
+
+- `voice_preset = "v2/en_speaker_6"` を `bark_processor` に渡して話者埋め込みを固定し、発話ごとに声質が暴れないようにする。
+- 手動で `BarkSemanticGenerationConfig` 等を組み立てる構成は廃止したため、`max_length`/`max_new_tokens` の競合や `generation_config` と重複引数を同時に渡すことに起因する `transformers` の警告は発生しない。
 
 > **temperature=0.2 は危険域**: 当初 `FLAT_TEMPERATURE = 0.2` としていたが、極端に低い temperature は Bark の自己回帰的な coarse/fine acoustics 生成でモード崩壊（同一の音響トークンが毎ステップ反復選択される）を引き起こし、デコード結果が人の声ではなく単一周波数の発振音（ハウリング/ピー音）になる不具合があった。`0.7` に引き上げることでサンプリングの多様性を確保し、この崩壊を回避している。
 
-**生成長の上限**: Bark-small の Semantic 段はデフォルトで `max_new_tokens=768`（Semantic レート ~49Hz 換算で 10 秒超）まで生成し得るが、固定応答フレーズは 1〜5 単語の短文しかない。`SEMANTIC_MAX_NEW_TOKENS = 96` でこれを明示的に絞り込み、Semantic 系列長を基準に決まる Coarse/Fine の生成長も連動して短縮する。各段の config 辞書からは競合の原因になる `max_length` を取り除き（`max_new_tokens` のみで上限を管理）、Fine 段の `generate` 呼び出しでは `fine_generation_config` と重複する `temperature` kwarg を渡さないようにした。これにより `transformers` の `Both 'max_new_tokens' and 'max_length' seem to have been set.` / `Passing 'generation_config' together with generation-related arguments... is deprecated` という警告の連打を解消している。
+**生成長の上限**: Bark-small の Semantic 段はデフォルトで `max_new_tokens=768`（Semantic レート ~49Hz 換算で 10 秒超）まで生成し得るが、固定応答フレーズは 1〜5 単語の短文しかない。`SEMANTIC_MAX_NEW_TOKENS = 96` でこれを明示的に絞り込み、Semantic 系列長を基準に決まる Coarse/Fine の生成長も連動して短縮する。
 
-**末尾無音のトリム**: `codec.decode` で復元した PCM に対し、`trim_trailing_silence`（20ms フレーム単位の RMS がしきい値 `0.01` を下回る末尾を切り捨てる簡易処理）を適用してから再生する。
+**末尾無音のトリム**: `bark_model.generate()` が返す PCM に対し、`trim_trailing_silence`（20ms フレーム単位の RMS がしきい値 `0.01` を下回る末尾を切り捨てる簡易処理）を適用してから再生する。
 
 ### 4.3 処理フロー
 
