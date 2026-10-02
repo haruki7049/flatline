@@ -32,21 +32,52 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_tests.step);
 
-    // Native response-asset player: replaces stream_decoder.py. Reads the 0xAA55
-    // commit protocol from stdin and plays back pre-built assets/responses/ via
-    // zaudio/miniaudio, with no Python/torch in the runtime path.
+    // Native audio I/O binaries, replacing the Python ends of the pipeline. Both
+    // link zaudio/miniaudio, with no Python/torch in the runtime path.
     const zaudio_dep = b.dependency("zaudio", .{
         .target = target,
         .optimize = optimize,
     });
 
-    const player_module = b.createModule(.{
-        .root_source_file = b.path("src/player.zig"),
+    const player_exe = addZaudioExecutable(b, target, optimize, zaudio_dep, "player", "src/player.zig");
+    b.installArtifact(player_exe);
+
+    const run_player_step = b.step("run-player", "Run the response-asset player");
+    const run_player_cmd = b.addRunArtifact(player_exe);
+    run_player_cmd.setCwd(b.path("."));
+    run_player_cmd.step.dependOn(b.getInstallStep());
+    run_player_step.dependOn(&run_player_cmd.step);
+
+    // Native microphone capture + RMS-based VAD flagging. Replaces
+    // stream_mic_encoder.py; writes the same 0xAA55 protocol that receiver.zig
+    // and player.zig already speak.
+    const capture_exe = addZaudioExecutable(b, target, optimize, zaudio_dep, "capture", "src/capture.zig");
+    b.installArtifact(capture_exe);
+
+    const run_capture_step = b.step("run-capture", "Run the microphone capture binary");
+    const run_capture_cmd = b.addRunArtifact(capture_exe);
+    run_capture_cmd.setCwd(b.path("."));
+    run_capture_cmd.step.dependOn(b.getInstallStep());
+    run_capture_step.dependOn(&run_capture_cmd.step);
+}
+
+/// Builds an executable that links zaudio/miniaudio, with the macOS framework
+/// search path fallback both player.zig and capture.zig need (see below).
+fn addZaudioExecutable(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zaudio_dep: *std.Build.Dependency,
+    name: []const u8,
+    root_source_file: []const u8,
+) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = b.path(root_source_file),
         .target = target,
         .optimize = optimize,
     });
-    player_module.addImport("zaudio", zaudio_dep.module("root"));
-    player_module.linkLibrary(zaudio_dep.artifact("miniaudio"));
+    module.addImport("zaudio", zaudio_dep.module("root"));
+    module.linkLibrary(zaudio_dep.artifact("miniaudio"));
 
     // zaudio's own build.zig resolves macOS frameworks through a lazy "system_sdk"
     // dependency that doesn't reliably link its framework search path through to
@@ -58,19 +89,12 @@ pub fn build(b: *std.Build) void {
         const sdk_frameworks = b.run(&.{ "sh", "-c", "xcrun --show-sdk-path 2>/dev/null" });
         const sdk_path = std.mem.trimEnd(u8, sdk_frameworks, "\n");
         if (sdk_path.len > 0) {
-            player_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+            module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
         }
     }
 
-    const player_exe = b.addExecutable(.{
-        .name = "player",
-        .root_module = player_module,
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = module,
     });
-    b.installArtifact(player_exe);
-
-    const run_player_step = b.step("run-player", "Run the response-asset player");
-    const run_player_cmd = b.addRunArtifact(player_exe);
-    run_player_cmd.setCwd(b.path("."));
-    run_player_cmd.step.dependOn(b.getInstallStep());
-    run_player_step.dependOn(&run_player_cmd.step);
 }

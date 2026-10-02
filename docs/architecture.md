@@ -1,14 +1,16 @@
 # Architecture
 
-現行パイプライン（`python/pipeline/stream_mic_encoder.py | ./receiver | ./player`）の実装に基づく通信プロトコルと各コンポーネントの仕様。企画段階の思想・将来案は [memo.md](memo.md) を参照（本ドキュメントは実装済みの挙動を正とする）。
+現行パイプライン（`./capture | ./receiver | ./player`、全て Zig ネイティブバイナリ）の実装に基づく通信プロトコルと各コンポーネントの仕様。企画段階の思想・将来案は [memo.md](memo.md) を参照（本ドキュメントは実装済みの挙動を正とする）。
 
-> **2026-10 改訂 (1)**: 40ms チャンク単位で EnCodec 推論を行う方式（チャンク境界の歪み・かすれ音の原因）を廃止し、パイプラインは「生 PCM をバッファリングし、確定した発話区間のみを一括で EnCodec に通す」方式へ移行した。`stream_mic_encoder.py` は EnCodec/torch に依存しなくなり、マイク入力と VAD 用の RMS 計算のみを行う。
+> **2026-10 改訂 (1)**: 40ms チャンク単位で EnCodec 推論を行う方式（チャンク境界の歪み・かすれ音の原因）を廃止し、パイプラインは「生 PCM をバッファリングし、確定した発話区間のみを一括で EnCodec に通す」方式へ移行した。`stream_mic_encoder.py`（当時）は EnCodec/torch に依存しなくなり、マイク入力と VAD 用の RMS 計算のみを行う。
 >
 > **2026-10 改訂 (2)**: `stream_decoder.py`（当時）はエコーバック（受け取った PCM をそのまま encode → decode して再生する）を廃止した。発話確定は「応答を生成するトリガー」としてのみ扱われ、受信 PCM の内容そのものは破棄する。応答は `suno/bark-small` を低 temperature (0.2) で駆動し、定型の冷淡な短文から生成した EnCodec トークンを再生する（§4）。
 >
 > **2026-10 改訂 (3)**: 実行時の Bark 推論をビルド時ツール (`build_response_assets.py`) に切り出し、`stream_decoder.py` は事前ビルド済みアセットを即時再生するだけの「トークンルーター」になった（§4）。
 >
 > **2026-10 改訂 (4)**: その `stream_decoder.py` 自体を撤廃し、`src/player.zig`（[zaudio](https://github.com/zig-gamedev/zaudio) を使用するネイティブ実装）に置き換えた。パイプライン後半の Python プロセスはこれで無くなった（§4.2）。
+>
+> **2026-10 改訂 (5)**: パイプライン前半に残っていた `stream_mic_encoder.py` も `src/capture.zig`（zaudio のキャプチャデバイスを使用するネイティブ実装）に置き換えた。これで実行時パイプラインから Python プロセスが完全に無くなった（§2.4）。
 
 ## 1. プロセス間通信プロトコル
 
@@ -27,13 +29,13 @@ const Header = extern struct {
 };
 ```
 
-Python 側 (`stream_mic_encoder.py`) は `struct.pack("<HBBI", magic, version, reserved, payload_len)` で、Zig 側 (`receiver.zig`, `player.zig`) は上記の `extern struct Header` で、同一の 8 byte レイアウトを生成・解釈する。
+`capture.zig`, `receiver.zig`, `player.zig` の 3 バイナリは全て同じ `extern struct Header` を使い、同一の 8 byte レイアウトを生成・解釈する（互換性のため構造体はそれぞれのファイルに重複定義している）。
 
 | フィールド | サイズ | 値 |
 |---|---|---|
 | `magic` | u16 | `0xAA55` 固定。不一致は即エラー終了 |
 | `version` | u8 | `1` 固定 |
-| `reserved` | u8 | `is_speech` フラグ。`stream_mic_encoder.py` → `receiver` 方向は RMS エネルギーがしきい値 `0.015` を超えれば `1`、それ以外は `0`。`receiver` → `player` 方向は常に `1`（確定済み発話のみを送るため） |
+| `reserved` | u8 | `is_speech` フラグ。`capture` → `receiver` 方向は RMS エネルギーがしきい値 `0.015` を超えれば `1`、それ以外は `0`。`receiver` → `player` 方向は常に `1`（確定済み発話のみを送るため） |
 | `payload_len` | u32 | ペイロードのバイト数 |
 
 `receiver.zig` はこの `reserved`（`is_speech`）フラグだけで無音/発話を判定する（後述）。旧実装にあった「ペイロード先頭トークン値が無音コード `110` かどうか」による判定は廃止された。
@@ -41,15 +43,15 @@ Python 側 (`stream_mic_encoder.py`) は `struct.pack("<HBBI", magic, version, r
 ### 1.2 ペイロード: 生 PCM
 
 - サンプルフォーマット: `int16` リトルエンディアン, モノラル, 24,000 Hz
-- EnCodec などのコーデック処理は**この段階では行わない**。`stream_mic_encoder.py` はマイクからの `float32` サンプルを `int16` に変換して送るだけで、torch/EnCodec には依存しない。
+- EnCodec などのコーデック処理は**この段階では行わない**。`capture.zig` は zaudio のキャプチャデバイスから直接 `int16` PCM を取得して送るだけで、torch/EnCodec には依存しない。
 
-`stream_mic_encoder.py` → `receiver` 方向は **40ms チャンク** (`CHUNK_SAMPLES = 960` サンプル @ 24kHz) を 1 パケットとして逐次送信する。ペイロードは常に `960 samples × 2 bytes = 1920 bytes`。
+`capture` → `receiver` 方向は **40ms チャンク** (`SAMPLES_PER_FRAME = 960` サンプル @ 24kHz) を 1 パケットとして逐次送信する。ペイロードは常に `960 samples × 2 bytes = 1920 bytes`。
 
 `receiver` → `player` 方向のペイロードは、VAD が確定した発話区間ぶんの生 PCM サンプル列をまとめて 1 パケットで送るため、長さはその発話の継続時間に応じて可変（`SAMPLES_PER_FRAME (960) × valid_frames`）。
 
 ### 1.3 EnCodec 推論のタイミング
 
-`receiver` から届く「発話確定」パケットは、現在は**応答生成のトリガーとしてのみ**使われる。`player`（および、その前身だった `stream_decoder.py`）はペイロード（ユーザーの発話内容そのもの）を読み捨て、代わりに事前ビルド済みの応答音声を再生する（§4）。実行時プロセスでは EnCodec の推論は一切発生しない。Bark-small と EnCodec によるトークン生成・デコードは `python/experiments/build_response_assets.py`（ビルド時ツール）でのみ行われる。
+`receiver` から届く「発話確定」パケットは、現在は**応答生成のトリガーとしてのみ**使われる。`player`（および、その前身だった `stream_decoder.py`）はペイロード（ユーザーの発話内容そのもの）を読み捨て、代わりに事前ビルド済みの応答音声を再生する（§4）。実行時プロセス（`capture`, `receiver`, `player` のいずれも）では EnCodec の推論は一切発生しない。Bark-small と EnCodec によるトークン生成・デコードは `python/experiments/build_response_assets.py`（ビルド時ツール）でのみ行われる。
 
 ## 2. Zig 側 VAD ステートマシン (`src/receiver.zig`)
 
@@ -70,7 +72,7 @@ idle ⇄ listening
 const is_silence = (header.reserved == 0);
 ```
 
-判定そのものは送信側（`stream_mic_encoder.py`）の RMS エネルギーしきい値に委ねられており、`receiver` は判定結果に従ってバッファリングと状態遷移のみを行う。
+判定そのものは送信側（`capture.zig`、§2.4）の RMS エネルギーしきい値に委ねられており、`receiver` は判定結果に従ってバッファリングと状態遷移のみを行う。
 
 ### 2.3 遷移条件
 
@@ -89,6 +91,17 @@ const is_silence = (header.reserved == 0);
    - `valid_frames = speech_frame_count - silence_frames`（末尾の無音ぶんを除いた実発話フレーム数）が `MIN_SPEECH_FRAMES` 未満なら `[IGNORED NOISE]` として**転送せず**破棄。
    - それ以外は `sample_buffer` の先頭 `valid_frames × SAMPLES_PER_FRAME` サンプルぶん（＝末尾の無音を切り捨てた生 PCM）を 1 パケットにまとめ、0xAA55 ヘッダ（`reserved = 1`）を付けて stdout（次段のデコーダ）へ転送し、`[SPEECH COMMITTED]` をログ。
 4. いずれの場合もバッファ・カウンタをリセットして `idle` に戻る。
+
+### 2.4 マイクキャプチャ (`src/capture.zig`、ネイティブ実装)
+
+当初この役割は Python の `stream_mic_encoder.py`（`sounddevice.InputStream` + 手動の RMS 計算）が担っていたが、実行時パイプラインから Python を完全に排除するため `src/capture.zig` に置き換えた。キャプチャバックエンドには `player.zig` と同じ [zaudio](https://github.com/zig-gamedev/zaudio) を使う。
+
+1. 起動時に `zaudio.Device.Config.init(.capture)` を構築し、`sample_rate = 24000`, `capture.format = .signed16`, `capture.channels = 1` を設定したうえで `zaudio.Device.create(null, config)` し `device.start()` する。デバイス自体はデフォルトの入力デバイス（マイク）を使う。
+2. 実際のキャプチャは miniaudio が内部で持つ専用のリアルタイムオーディオスレッドが呼び出す `data_callback`（`Device.DataProc`）の中で行われる。メインスレッドは `std.Io.sleep` で待機し続けるだけ。
+3. `data_callback` はコールバックごとに渡される `input` フレーム列を `CaptureState.buffer`（固定長 `[960]i16`）へ1サンプルずつ詰めていき、`SAMPLES_PER_FRAME (960)` 個溜まるたびに即座に1パケット分の処理（§1.1/§1.2 のヘッダ付与・RMS判定）を行って `emitChunk` を呼ぶ。miniaudio が1回のコールバックで渡すフレーム数は backend 依存で 960 と一致しない場合があるため、ちょうど960個単位になるまでこのバッファで吸収する。
+4. `emitChunk` は 960 サンプルぶんの `int16` から RMS（`sqrt(mean((sample/32768)^2))`）を計算し、しきい値 `0.015` 判定を `reserved`（`is_speech`）に格納してヘッダを構築、`std.c.write` で直接 fd 1 (stdout) へ書き込む（`receiver.zig`/`player.zig` と同じ直接 POSIX I/O のスタイル）。
+
+`data_callback` はリアルタイムオーディオスレッド上で動くため、ここで行う RMS計算・ヘッダ構築・`write(2)` 呼び出しは全て単一スレッド内の逐次処理であり、追加のロックや同期機構は不要（プロデューサーは1つだけ）。ダウンストリーム（`receiver`）がパイプを閉じた場合、`write` はエラーを返すかプロセスへ `SIGPIPE` が届いて終了する。
 
 ## 4. 冷淡な思考層プロトタイプ: オフライン事前ビルド + ネイティブ実行時トークンルーター
 
@@ -148,14 +161,14 @@ macOS でのビルド時の注意: `zaudio`/`miniaudio` は CoreAudio 等のフ�
 
 ### 5.1 チャンク境界の歪み・かすれ音（解消済み）
 
-旧実装では `stream_mic_encoder.py` が 40ms (960 サンプル) ごとに独立して EnCodec へ推論をかけていた。EnCodec の SEANet エンコーダ/デコーダは因果的 (causal) な畳み込みで前後の文脈を一部参照するため、40ms 単位で推論セッションを区切るとチャンクの境界で音響特徴が不連続になり、再生時に歪み・かすれが生じていた。
+旧実装では `stream_mic_encoder.py`（当時）が 40ms (960 サンプル) ごとに独立して EnCodec へ推論をかけていた。EnCodec の SEANet エンコーダ/デコーダは因果的 (causal) な畳み込みで前後の文脈を一部参照するため、40ms 単位で推論セッションを区切るとチャンクの境界で音響特徴が不連続になり、再生時に歪み・かすれが生じていた。
 
-**対応済み**: `stream_mic_encoder.py` は EnCodec 推論を行わず生 PCM を逐次送るだけに変更し、`receiver.zig` が発話区間ぶんの生 PCM をバッファリングするようにした。この改修自体はエコーバック時代に行ったものだが、実行時の応答生成がエコーバック → Bark 直接合成 → 事前ビルド済みアセットの再生（§4、現在は `player.zig`）と変わった現在も、VAD が「発話確定」を1つのまとまった単位で検出する役割は変わらず活きている。40ms ごとの再推論・境界不連続という問題そのものは、その後の応答生成方式の変更とは独立に解消済み。
+**対応済み**: マイク側（現在は `capture.zig`）は EnCodec 推論を行わず生 PCM を逐次送るだけに変更し、`receiver.zig` が発話区間ぶんの生 PCM をバッファリングするようにした。この改修自体はエコーバック時代に行ったものだが、実行時の応答生成がエコーバック → Bark 直接合成 → 事前ビルド済みアセットの再生（§4、現在は `player.zig`）と変わった現在も、VAD が「発話確定」を1つのまとまった単位で検出する役割は変わらず活きている。40ms ごとの再推論・境界不連続という問題そのものは、その後の応答生成方式の変更とは独立に解消済み。
 
 ### 5.2 思考層 (LLM) の未結合（部分的に着手）
 
 §4 で「発話確定 → 事前ビルド済み固定フレーズ群からのランダム選択 → プリビルド済み音声の即時再生」という応答生成プロトタイプを導入したが、これは疎通確認・低遅延化目的の仮実装であり、まだ対話としての思考層ではない。入力音声の文字起こし（ASR）も、聞いた内容に基づくテキスト生成（自己回帰モデルによる応答テキスト生成）も行っていない。`docs/memo.md` に記載の「無感情化（Monotone Control）」や 1B〜2B クラスの軽量 LLM 統合は未着手のフェーズ 3 相当であり、次のマイルストーンとして残っている（将来的には、ASR結果からカテゴリ `ack`/`status`/`reject`/`complete` 等をルーティングする、あるいはLLMが直接カテゴリを選ぶ形が想定される）。
 
-### 5.3 Python スキャフォールドの段階的排除（進行中）
+### 5.3 Python スキャフォールドの排除（実行時パイプラインは完了）
 
-EnCodec のエンコード/デコード処理自体は `src/encoder.zig` / `src/decoder.zig` / `src/rvq.zig` に Zig 実装済みで、`hoge --encode` / `hoge --stream` から呼び出せる状態にある。応答再生側は `python/pipeline/stream_decoder.py` を削除し `src/player.zig`（§4.2）に置き換えたことで、パイプライン中で Python プロセスが必要なのは `stream_mic_encoder.py`（マイク入力・RMSベースのVADフラグ算出のみ、EnCodec/torch は不使用）1つだけになった。重い推論 (`suno/bark-small`) は `python/experiments/build_response_assets.py` というビルド時ツールに切り出されており、実行時パイプラインとは完全に分離されている。残る `stream_mic_encoder.py` を Zig 側 (`src/main.zig` 系、または `receiver.zig`/`player.zig` 同様の新規バイナリ) に統合すれば、パイプライン全体が単一バイナリ（または複数の Zig バイナリのみ）で完結する。
+EnCodec のエンコード/デコード処理自体は `src/encoder.zig` / `src/decoder.zig` / `src/rvq.zig` に Zig 実装済みで、`hoge --encode` / `hoge --stream` から呼び出せる状態にある。応答再生側は `python/pipeline/stream_decoder.py` を削除し `src/player.zig`（§4.2）に、マイク入力側は `python/pipeline/stream_mic_encoder.py` を削除し `src/capture.zig`（§2.4）に置き換えた。これにより実行時パイプライン (`capture | receiver | player`) から Python プロセスは完全に無くなった。重い推論 (`suno/bark-small`) は `python/experiments/build_response_assets.py` というビルド時ツールに切り出されており、実行時パイプラインとは完全に分離されている。残る作業は、`hoge` / `receiver` / `capture` / `player` という複数の Zig バイナリを単一バイナリへ統合すること。
